@@ -1,0 +1,14 @@
+# Binaries
+*.exe
+*.dll
+
+# Config with secrets
+config.json
+
+# Logs
+logs/
+*.log
+
+# IDEs
+.vscode/
+.idea/

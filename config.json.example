@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": "21",
+  "user": "username",
+  "pass": "password",
+  "remote_dir": "",
+  "local_dir": "./downloads",
+  "log_dir": "./logs",
+  "use_implicit_tls": false,
+  "insecure_skip_verify": true
+}
