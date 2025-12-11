@@ -3,29 +3,37 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jlaffaye/ftp"
 )
 
+// PathMapping 定義路徑與檔案的對應關係
+type PathMapping struct {
+	RemotePath string
+	Files      []string
+}
+
 // Config 定義設定檔結構
 type Config struct {
-	Host               string `json:"host"`
-	Port               string `json:"port"`
-	User               string `json:"user"`
-	Pass               string `json:"pass"`
-	RemoteDir          string `json:"remote_dir"`
-	LocalDir           string `json:"local_dir"`
-	LogDir             string `json:"log_dir"`
-	UseImplicitTLS     bool   `json:"use_implicit_tls"`
-	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
+	Host               string
+	Port               string
+	User               string
+	Pass               string
+	RemoteDir          string
+	LocalDir           string
+	LogDir             string
+	FileNames          []PathMapping
+	UseImplicitTLS     bool
+	InsecureSkipVerify bool
 }
 
 func pause() {
@@ -40,17 +48,97 @@ func loadConfig(path string) (*Config, error) {
 	}
 	defer file.Close()
 
-	var config Config
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&config); err != nil {
+	config := &Config{
+		FileNames: make([]PathMapping, 0),
+	}
+	
+	// 用於臨時存儲解析的資料
+	pathMappings := make(map[int]*PathMapping)
+	fileItems := make(map[string]string) // key: "pathIndex.fileIndex"
+	
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		
+		// 跳過空行和註解
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// 解析 key=value
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		
+		// 解析基本設定
+		switch key {
+		case "host":
+			config.Host = value
+		case "port":
+			config.Port = value
+		case "user":
+			config.User = value
+		case "pass":
+			config.Pass = value
+		case "remote_dir":
+			config.RemoteDir = value
+		case "local_dir":
+			config.LocalDir = value
+		case "log_dir":
+			config.LogDir = value
+		case "use_implicit_tls":
+			config.UseImplicitTLS = (value == "true")
+		case "insecure_skip_verify":
+			config.InsecureSkipVerify = (value == "true")
+		default:
+			// 解析 file_names 相關設定
+			if strings.HasPrefix(key, "file_names.") {
+				parts := strings.Split(key, ".")
+				if len(parts) >= 3 {
+					pathIdx, _ := strconv.Atoi(parts[1])
+					
+					if parts[2] == "remote_path" {
+						if pathMappings[pathIdx] == nil {
+							pathMappings[pathIdx] = &PathMapping{Files: make([]string, 0)}
+						}
+						pathMappings[pathIdx].RemotePath = value
+					} else if parts[2] == "files" && len(parts) >= 4 {
+						fileIdx, _ := strconv.Atoi(parts[3])
+						mapKey := fmt.Sprintf("%d.%d", pathIdx, fileIdx)
+						fileItems[mapKey] = value
+					}
+				}
+			}
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	return &config, nil
+	
+	// 組合 PathMapping 和檔案名稱
+	for pathIdx := 0; pathIdx < len(pathMappings)+10; pathIdx++ {
+		if pm, exists := pathMappings[pathIdx]; exists {
+			for fileIdx := 0; fileIdx < 100; fileIdx++ {
+				mapKey := fmt.Sprintf("%d.%d", pathIdx, fileIdx)
+				if fileName, exists := fileItems[mapKey]; exists {
+					pm.Files = append(pm.Files, fileName)
+				}
+			}
+			config.FileNames = append(config.FileNames, *pm)
+		}
+	}
+	
+	return config, nil
 }
 
 func main() {
 	// 定義命令列參數，只保留設定檔路徑
-	configFile := flag.String("config", "config.json", "Path to configuration file")
+	configFile := flag.String("config", "config.properties", "Path to configuration file")
 	flag.Parse()
 
 	// 讀取設定檔
@@ -58,7 +146,6 @@ func main() {
 	if err != nil {
 		log.Printf("Error loading config file '%s': %v", *configFile, err)
 		log.Println("Please ensure config.json exists and is valid.")
-		pause()
 		os.Exit(1)
 	}
 
@@ -117,7 +204,6 @@ func main() {
 
 	if err != nil {
 		log.Printf("Error connecting to server: %v", err)
-		pause()
 		os.Exit(1)
 	}
 	defer c.Quit()
@@ -127,7 +213,6 @@ func main() {
 	// 登入
 	if err := c.Login(config.User, config.Pass); err != nil {
 		log.Printf("Error logging in: %v", err)
-		pause()
 		os.Exit(1)
 	}
 
@@ -144,7 +229,6 @@ func main() {
 	if config.RemoteDir != "" {
 		if err := c.ChangeDir(config.RemoteDir); err != nil {
 			log.Printf("Error changing directory to %s: %v", config.RemoteDir, err)
-			pause()
 			os.Exit(1)
 		}
 		log.Printf("Changed directory to %s", config.RemoteDir)
@@ -154,7 +238,6 @@ func main() {
 	files, err := c.NameList("")
 	if err != nil {
 		log.Printf("Error listing files: %v", err)
-		pause()
 		os.Exit(1)
 	}
 
@@ -167,48 +250,127 @@ func main() {
 	// 確保本地下載目錄存在
 	if err := os.MkdirAll(config.LocalDir, 0755); err != nil {
 		log.Printf("Error creating local directory: %v", err)
-		pause()
 		os.Exit(1)
 	}
 
 	log.Printf("Found %d files. Starting download...", len(files))
 
-	for _, name := range files {
-		// 過濾掉 . 和 ..
-		if name == "." || name == ".." {
-			continue
+	downloadCount := 0
+	
+	// 如果 config.FileNames 有指定檔案，優先下載這些檔案
+	if len(config.FileNames) > 0 {
+		log.Println("Downloading specified files from config...")
+		for _, pathMap := range config.FileNames {
+			basePath := strings.TrimSpace(pathMap.RemotePath)
+			
+			// 處理此路徑下的每個檔案
+			for _, fileSpec := range pathMap.Files {
+				fileSpec = strings.TrimSpace(fileSpec)
+				if fileSpec == "" {
+					continue
+				}
+				
+				// 解析檔名格式: "遠端檔名:本地檔名" 或只有 "遠端檔名"
+				var remoteFileName, localFileName string
+				if idx := strings.Index(fileSpec, ":"); idx >= 0 {
+					// 有指定本地檔名
+					remoteFileName = strings.TrimSpace(fileSpec[:idx])
+					localFileName = strings.TrimSpace(fileSpec[idx+1:])
+					if localFileName == "" {
+						// 如果本地檔名為空，使用遠端檔名
+						localFileName = remoteFileName
+					}
+				} else {
+					// 沒有指定本地檔名，使用遠端檔名
+					remoteFileName = fileSpec
+					localFileName = fileSpec
+				}
+				
+				// 組合完整的遠端路徑（Guardian 系統使用點作為分隔符）
+				var fullRemotePath string
+				if basePath == "" {
+					fullRemotePath = remoteFileName
+				} else {
+					// Guardian 系統使用點(.)作為路徑分隔符，不是反斜線
+					if strings.HasSuffix(basePath, ".") {
+						fullRemotePath = basePath + remoteFileName
+					} else {
+						fullRemotePath = basePath + "." + remoteFileName
+					}
+				}
+				
+				log.Printf("Downloading %s to %s ...", fullRemotePath, localFileName)
+				
+				// 下載檔案
+				r, err := c.Retr(fullRemotePath)
+				if err != nil {
+					log.Printf("Error retrieving file %s: %v", fullRemotePath, err)
+					continue
+				}
+				
+				// 使用指定的本地檔名
+				localPath := filepath.Join(config.LocalDir, localFileName)
+				
+				// 建立本地檔案
+				f, err := os.Create(localPath)
+				if err != nil {
+					log.Printf("Error creating local file %s: %v", localPath, err)
+					r.Close()
+					continue
+				}
+				
+				// 寫入內容
+				n, err := io.Copy(f, r)
+				r.Close()
+				f.Close()
+				
+				if err != nil {
+					log.Printf("Error writing file %s: %v", localPath, err)
+				} else {
+					log.Printf("Downloaded %s to %s (%d bytes)", fullRemotePath, localPath, n)
+					downloadCount++
+				}
+			}
 		}
+	} else {
+		// 原本的邏輯：從當前目錄下載所有檔案
+		for _, name := range files {
+			// 過濾掉 . 和 ..
+			if name == "." || name == ".." {
+				continue
+			}
 
-		log.Printf("Downloading %s ...", name)
+			log.Printf("Downloading %s ...", name)
 
-		// 下載檔案
-		r, err := c.Retr(name)
-		if err != nil {
-			log.Printf("Error retrieving file %s: %v", name, err)
-			continue
-		}
+			// 下載檔案
+			r, err := c.Retr(name)
+			if err != nil {
+				log.Printf("Error retrieving file %s: %v", name, err)
+				continue
+			}
 
-		// 建立本地檔案
-		localPath := filepath.Join(config.LocalDir, name)
-		f, err := os.Create(localPath)
-		if err != nil {
-			log.Printf("Error creating local file %s: %v", localPath, err)
+			// 建立本地檔案
+			localPath := filepath.Join(config.LocalDir, name)
+			f, err := os.Create(localPath)
+			if err != nil {
+				log.Printf("Error creating local file %s: %v", localPath, err)
+				r.Close()
+				continue
+			}
+
+			// 寫入內容
+			n, err := io.Copy(f, r)
 			r.Close()
-			continue
-		}
+			f.Close()
 
-		// 寫入內容
-		n, err := io.Copy(f, r)
-		r.Close()
-		f.Close()
-
-		if err != nil {
-			log.Printf("Error writing file %s: %v", localPath, err)
-		} else {
-			log.Printf("Downloaded %s to %s (%d bytes)", name, localPath, n)
+			if err != nil {
+				log.Printf("Error writing file %s: %v", localPath, err)
+			} else {
+				log.Printf("Downloaded %s to %s (%d bytes)", name, localPath, n)
+				downloadCount++
+			}
 		}
 	}
 
-	log.Println("All tasks completed.")
-	pause()
+	log.Printf("Download completed. %d file(s) downloaded.", downloadCount)
 }

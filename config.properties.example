@@ -1,0 +1,43 @@
+# FTPS Downloader 設定檔範例
+
+# FTPS 伺服器設定
+host=127.0.0.1
+# 埠號: 21=Explicit TLS, 990=Implicit TLS
+port=21
+# 登入帳號
+user=username
+# 登入密碼
+pass=password
+
+# 目錄設定
+# 遠端起始目錄 (選填，若使用 file_names 指定完整路徑則可留空)
+remote_dir=
+# 本地下載目錄
+local_dir=./downloads
+# 日誌檔目錄 (選填，留空則只輸出到螢幕)
+log_dir=./logs
+
+# TLS 設定
+# 是否使用 Implicit TLS (通常 port 990)
+use_implicit_tls=false
+# 是否跳過 SSL 憑證驗證 (測試環境可設為 true)
+insecure_skip_verify=true
+
+# 要下載的檔案清單 (若無指定則下載當前目錄所有檔案)
+# 格式說明:
+#   file_names.路徑索引.remote_path=遠端路徑
+#   file_names.路徑索引.files.檔案索引=遠端檔名[:本地檔名]
+#   
+#   檔名格式:
+#   - 只寫遠端檔名: RYM01 (下載後也命名為 RYM01)
+#   - 指定本地檔名: RYM01:renamed_file.txt (下載 RYM01 存成 renamed_file.txt)
+
+# 範例: Guardian 系統路徑 (使用點作為分隔符)
+file_names.0.remote_path=\\CSTP96.$DATA.SKDATA91
+file_names.0.files.0=RYM01
+file_names.0.files.1=RYM02:custom_name.txt
+
+# 可新增更多路徑，索引遞增即可
+#file_names.1.remote_path=\\ANOTHER.$PATH
+#file_names.1.files.0=FILE01
+#file_names.1.files.1=FILE02

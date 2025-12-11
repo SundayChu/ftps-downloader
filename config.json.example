@@ -1,11 +1,41 @@
 {
+  "_comment": "FTPS Downloader 設定檔",
   "host": "127.0.0.1",
+  "_host_comment": "FTPS 伺服器位址",
   "port": "21",
+  "_port_comment": "FTPS 伺服器埠號 (21=Explicit TLS, 990=Implicit TLS)",
   "user": "username",
+  "_user_comment": "登入帳號",
   "pass": "password",
+  "_pass_comment": "登入密碼",
   "remote_dir": "",
+  "_remote_dir_comment": "遠端起始目錄 (選填，若使用 file_names 指定完整路徑則可留空)",
   "local_dir": "./downloads",
+  "_local_dir_comment": "本地下載目錄",
   "log_dir": "./logs",
+  "_log_dir_comment": "日誌檔目錄 (選填，留空則只輸出到螢幕)",
+  "file_names": [
+    {
+      "_comment": "每個 remote_path 可包含多個檔案",
+      "remote_path": "\\CSTP96.$DATA.SKDATA91",
+      "_path_comment": "Guardian 系統路徑 (使用點作為分隔符)",
+      "files": [
+        {
+          "name": "RYM01",
+          "_name_comment": "檔案名稱",
+          "local_name": "RYM01.dat",
+          "_local_name_comment": "本地儲存檔名 (選填，留空則使用原檔名)"
+        },
+        {
+          "name": "RYM02",
+          "local_name": "RYM02.dat"
+        }
+      ]
+    }
+  ],
+  "_file_names_comment": "要下載的檔案清單 (空陣列則下載當前目錄所有檔案)",
   "use_implicit_tls": false,
-  "insecure_skip_verify": true
+  "_use_implicit_tls_comment": "是否使用 Implicit TLS (通常 port 990)",
+  "insecure_skip_verify": true,
+  "_insecure_skip_verify_comment": "是否跳過 SSL 憑證驗證 (測試環境可設為 true)"
 }
