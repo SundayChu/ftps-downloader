@@ -23,6 +23,35 @@ use_implicit_tls=false
 # 是否跳過 SSL 憑證驗證 (測試環境可設為 true)
 insecure_skip_verify=true
 
+# 編碼設定 (針對 Guardian/NonStop 等特殊系統)
+# source_encoding: 來源檔案編碼
+#   - ebcdic 或 cp037: IBM EBCDIC US
+#   - cp1047: IBM EBCDIC Latin-1
+#   - cp1140: IBM EBCDIC US with Euro
+#   - big5: Big5 繁體中文
+#   - utf-8: UTF-8
+#   - iso-8859-1: ISO Latin-1
+# target_encoding: 目標檔案編碼 (big5, utf-8 等)
+# debug_encoding: 是否輸出編碼調試資訊 (true/false)
+# skip_header_bytes: 處理檔案中的二進制數據（不建議使用，可能導致檔案損壞）
+#   - 正數 (如 20): 固定跳過開頭指定字節數
+#   - -1: 自動過濾整個檔案中的控制字元（僅適用於純文字檔案）
+#   - 0 或不設定: 不處理任何內容（推薦，保持原始檔案）
+# guardian_add_crlf: 剝除 Guardian 區塊後是否補上 CRLF 行結尾 (true/false，預設 true)
+# raw_download: 原始下載模式，不進行任何資料處理，保持與遠端檔案完全一致 (true/false，預設 false)
+#   - 設為 true 時會跳過所有編碼轉換、Guardian 區塊剝除、控制字元過濾等處理
+#   - 適用於需要保持原始二進制內容的場景
+# 
+# 注意：程式會自動驗證下載檔案大小是否與遠端一致
+# 
+# 如果不需要轉換編碼或過濾，請留空或註解掉
+#source_encoding=
+#target_encoding=
+#debug_encoding=false
+#skip_header_bytes=0
+#guardian_add_crlf=true
+#raw_download=false
+
 # 要下載的檔案清單 (若無指定則下載當前目錄所有檔案)
 # 格式說明:
 #   file_names.路徑索引.remote_path=遠端路徑

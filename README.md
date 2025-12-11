@@ -32,7 +32,7 @@
 
 ## 使用說明
 
-編譯完成後，您可以直接在命令列執行 `ftps-downloader.exe`。
+編譯完成後，您可以直接在命令列執行 `ftps-downloader.exe`。程式使用內建的 Go FTPS 客戶端進行下載，無需額外安裝其他軟體。
 
 ### 參數說明
 
@@ -46,6 +46,7 @@
 | `-out` | `./downloads` | 本地儲存檔案的目錄 |
 | `-implicit` | `false` | 是否使用 Implicit TLS (通常是 Port 990) |
 | `-insecure` | `false` | 是否略過 SSL 憑證驗證 (用於自簽憑證) |
+| `-raw-download` | `false` | 原始下載模式，不進行任何資料處理，保持與遠端檔案完全一致 |
 
 ### 執行範例
 
@@ -71,6 +72,12 @@
 
 ```bash
 ./ftps-downloader.exe -host 192.168.1.100 -user test -pass test -insecure=true
+```
+
+**5. 原始下載模式（保持與遠端檔案完全一致）**
+
+```bash
+./ftps-downloader.exe -host ftp.example.com -user myuser -pass mypassword --raw-download
 ```
 
 ## 佈署說明

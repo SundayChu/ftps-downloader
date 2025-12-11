@@ -1,14 +1,23 @@
-# Binaries
+# Compiled binaries
 *.exe
 *.dll
+*.so
+*.dylib
 
-# Config with secrets
+# Test files
+*.ftps
+*.filezilla
+*.backup
+strip_test.go
+
+# Download directories
+downloads/
+logs/
+
+# Config files with sensitive data
+config.properties
 config.json
 
-# Logs
-logs/
-*.log
-
-# IDEs
-.vscode/
-.idea/
+# OS files
+.DS_Store
+Thumbs.db
