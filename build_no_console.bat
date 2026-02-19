@@ -4,7 +4,7 @@ REM Build FTPS Downloader without console window
 echo Building ftps-downloader.exe without console window...
 
 REM Build with -H=windowsgui flag to hide console window
-go build -ldflags="-H=windowsgui" -o ftps-downloader.exe main.go
+go build -ldflags="-H=windowsgui" -o ftps-downloader.exe ./cmd/downloader
 
 if %ERRORLEVEL% EQU 0 (
     echo Build successful! ftps-downloader.exe created.

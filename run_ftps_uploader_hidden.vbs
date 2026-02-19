@@ -8,7 +8,7 @@ scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 WshShell.CurrentDirectory = scriptDir
 
 ' Build and run via batch script (hidden window)
-commandLine = "cmd.exe /c """ & scriptDir & "\run_ftps_downloader.bat"""
+commandLine = "cmd.exe /c """ & scriptDir & "\run_ftps_uploader.bat"""
 WshShell.Run commandLine, 0, True
 
 ' Exit code will be returned to Task Scheduler

@@ -1,0 +1,193 @@
+# ================================================================
+# FTPS Downloader 標準設定檔
+# ================================================================
+
+# ================================================================
+# 基本連線設定
+# ================================================================
+# FTPS 伺服器位址
+host=127.0.0.1
+
+# 連接埠 (21=Explicit TLS, 990=Implicit TLS)
+port=21
+
+# 登入帳號
+user=username
+
+# 登入密碼
+pass=password
+
+# ================================================================
+# 目錄設定
+# ================================================================
+# 遠端起始目錄 (選填)
+remote_dir=
+
+# 本地下載目錄
+local_dir=./downloads
+
+# 日誌檔目錄 (選填，留空則只輸出到螢幕)
+log_dir=./logs
+
+# ================================================================
+# TLS 設定
+# ================================================================
+# 是否使用 Implicit TLS (通常使用 port 990)
+use_implicit_tls=false
+
+# 是否跳過 SSL 憑證驗證 (測試環境可設為 true)
+insecure_skip_verify=true
+
+# ================================================================
+# 監控模式設定
+# ================================================================
+# 是否啟用全天候監控模式 (true/false，預設 false)
+# - true: 程式持續運行，定期檢查並下載
+# - false: 執行一次下載後結束
+monitor_mode=false
+
+# 檢查間隔（分鐘，預設 30）
+# 監控模式下，每隔多久檢查一次
+check_interval=30
+
+# 允許下載的時間範圍（格式：HH:mm-HH:mm）
+# 例如 "02:00-05:00" 表示只在凌晨 2-5 點下載
+# 支援跨午夜，例如 "22:00-04:00"
+# 不設定則任何時間都可下載
+#allowed_time_range=02:00-05:00
+
+# 自動停止時間（格式：HH:mm）
+# 到達此時間後程式自動關閉
+# 適合搭配排程器每天定時啟動和停止
+#stop_time=18:00
+
+# ================================================================
+# 編碼設定 (用於 Guardian/NonStop 等特殊系統)
+# ================================================================
+# 來源檔案編碼
+# 支援: ebcdic, cp037, cp1047, cp1140, big5, utf-8, iso-8859-1
+#source_encoding=
+
+# 目標檔案編碼
+#target_encoding=
+
+# 是否輸出編碼調試資訊
+#debug_encoding=false
+
+# 跳過檔案開頭的字節數
+# - 正數: 跳過指定字節數
+# - -1: 過濾控制字元
+# - 0: 不處理（推薦）
+#skip_header_bytes=0
+
+# Guardian 區塊處理後是否補上 CRLF
+#guardian_add_crlf=true
+
+# 原始下載模式（不進行任何處理）
+# true: 保持與遠端檔案完全一致
+#raw_download=false
+
+# ================================================================
+# 檔案下載設定
+# ================================================================
+# 結帳檔設定（DATCLOSE 機制）
+# 結帳檔名稱
+#flag_file_name=DATCLOSE
+
+# 結帳檔專用下載路徑（程式會先從這個路徑下載 DATCLOSE）
+# 例如：\CSTP96.$DATA.SKWORK
+#flag_file_path=\CSTP96.$DATA.SKWORK
+
+# 下載完成後自動刪除 DATCLOSE（預設 true）
+#auto_delete_flag_file=true
+
+# 結帳檔檢查（全局設定，將被棄用，建議在各路徑中獨立設定）
+#check_flag_file=false
+
+# 檔案分割設定（針對特定前綴的檔案）
+#split_file_prefixes=TCD,TSC
+
+# 為每個檔案產生獨立 log (true/false，預設 false)
+# - true: 每個下載檔案會產生獨立的 .log 檔，記錄時間與大小比對資訊
+# - false: 所有資訊只寫入主 log 檔
+#separate_file_log=false
+
+# ================================================================
+# 下載檔案清單
+# ================================================================
+# 若無指定則下載當前目錄所有檔案
+#
+# 支援多種方式：
+# 1. files: 明確指定檔案
+#    file_names.0.files.0=檔名
+#    file_names.0.files.1=遠端檔名:本地檔名
+#
+# 2. patterns: 萬用字元匹配
+#    file_names.0.patterns.0=*.txt
+#    file_names.0.patterns.1=TCD*
+#
+# 3. include_prefixes: 前綴篩選
+#    file_names.0.include_prefixes.0=TCD
+#
+# 4. include_suffixes: 後綴篩選
+#    file_names.0.include_suffixes.0=.5920
+#
+# 5. exclude_files: 排除檔案
+#    file_names.0.exclude_files.0=test.txt
+#
+# ================================================================
+
+# 範例 1: 基本檔案下載
+file_names.0.remote_path=\\CSTP96.$DATA.SKDATA91
+file_names.0.files.0=RYM01
+file_names.0.files.1=RYM02
+
+# 範例 2: 使用時間範圍和前綴篩選
+#file_names.1.remote_path=\\CSTP96.$DATA.SKDATA91
+#file_names.1.allowed_time_range=02:00-05:00
+#file_names.1.include_prefixes.0=TCD
+#file_names.1.include_prefixes.1=TSC
+
+# 範例 3: 使用萬用字元和後綴篩選
+#file_names.2.remote_path=\\CSTP96.$DATA.SKDATA91
+#file_names.2.patterns.0=*.5920
+#file_names.2.include_suffixes.0=.5920
+
+# 範例 4: 排除特定檔案
+#file_names.3.remote_path=\\CSTP96.$DATA.SKDATA91
+#file_names.3.exclude_files.0=test
+#file_names.3.exclude_files.1=backup
+
+# 範例 5: 針對特定路徑啟用結帳檔檢查（檢查本地 DATCLOSE）
+# 注意：這會檢查本地是否有當天的 DATCLOSE，而非遠端
+#file_names.4.remote_path=\\CSTP96.$DATA.SKINTER1
+#file_names.4.check_flag_file=true
+#file_names.4.flag_file_name=DATCLOSE
+#file_names.4.files.0=BONDW
+#file_names.4.files.1=TCD5920
+
+# ================================================================
+# 使用說明
+# ================================================================
+# 
+# 【一般使用】
+# 1. 複製此檔案為 config.properties
+# 2. 修改連線設定 (host, user, pass)
+# 3. 設定下載目錄和檔案清單
+# 4. 執行: ftps-downloader.exe
+#
+# 【監控模式】
+# 1. 設定 monitor_mode=true
+# 2. 設定 check_interval 和 allowed_time_range
+# 3. 背景執行: run_ftps_downloader_hidden.vbs
+#
+# 【自動停止】
+# 1. 設定 stop_time=18:00
+# 2. 搭配排程器每天定時啟動
+# 3. 程式會在設定時間自動停止
+#
+# 詳細說明請參考:
+# - README.md
+# - MONITOR_MODE_GUIDE.md
+# - AUTO_STOP_GUIDE.md
+# ================================================================

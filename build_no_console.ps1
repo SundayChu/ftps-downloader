@@ -3,7 +3,7 @@
 Write-Host "Building ftps-downloader.exe without console window..." -ForegroundColor Cyan
 
 # Build with -H=windowsgui flag to hide console window
-go build -ldflags="-H=windowsgui" -o ftps-downloader.exe main.go
+go build -ldflags="-H=windowsgui" -o ftps-downloader.exe ./cmd/downloader
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build successful! ftps-downloader.exe created." -ForegroundColor Green
