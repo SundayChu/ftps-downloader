@@ -24,10 +24,11 @@ import (
 )
 
 type PathMapping struct {
-	RemotePath    string
-	Files         []string
-	CheckFlagFile bool   // 是否檢查結帳檔（此路徑專用）
-	FlagFileName  string // 結帳檔名稱（此路徑專用）
+	RemotePath       string
+	Files            []string
+	CheckFlagFile    bool   // 是否檢查結帳檔（此路徑專用）
+	FlagFileName     string // 結帳檔名稱（此路徑專用）
+	AllowedTimeRange string // 此路徑的允許下載時間範圍（格式: HH:mm-HH:mm）
 }
 
 type Config struct {
@@ -53,6 +54,7 @@ type Config struct {
 	StopTime           string   // 自動停止時間，格式: "HH:mm", 例如 "18:00"
 	SplitFilePrefixes  []string // 需要自動分檔的檔案前綴，例如: ["TCD", "TSC"]
 	SeparateFileLog    bool     // 是否為每個檔案產生獨立的 log
+	LogRetentionDays   int      // 日誌保留天數（包含分檔日誌）
 	CheckFlagFile      bool     // 是否檢查結帳檔（全局，已棄用）
 	FlagFileName       string   // 結帳檔名稱
 	FlagFilePath       string   // DATCLOSE 專用下載路徑
@@ -339,6 +341,10 @@ func loadConfig(path string) (*Config, error) {
 			}
 		case "separate_file_log":
 			cfg.SeparateFileLog = (value == "true")
+		case "log_retention_days":
+			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+				cfg.LogRetentionDays = n
+			}
 		case "check_flag_file":
 			cfg.CheckFlagFile = (value == "true")
 		case "flag_file_name":
@@ -367,6 +373,11 @@ func loadConfig(path string) (*Config, error) {
 							pathMappings[pathIdx] = &PathMapping{Files: make([]string, 0)}
 						}
 						pathMappings[pathIdx].FlagFileName = value
+					} else if tokens[2] == "allowed_time_range" {
+						if pathMappings[pathIdx] == nil {
+							pathMappings[pathIdx] = &PathMapping{Files: make([]string, 0)}
+						}
+						pathMappings[pathIdx].AllowedTimeRange = value
 					} else if tokens[2] == "files" && len(tokens) >= 4 {
 						fileIdx, _ := strconv.Atoi(tokens[3])
 						mapKey := fmt.Sprintf("%d.%d", pathIdx, fileIdx)
@@ -420,8 +431,9 @@ func writeFileLog(cfg *Config, localName string, info map[string]string) error {
 		return fmt.Errorf("create log directory: %w", err)
 	}
 	
-	// 產生 log 檔案名稱：原檔名 + .log
-	logFileName := fmt.Sprintf("%s.log", localName)
+	// 產生 log 檔案名稱：原檔名-日期.log（分天記錄）
+	today := time.Now().Format("2006-01-02")
+	logFileName := fmt.Sprintf("%s-%s.log", localName, today)
 	logPath := filepath.Join(logDir, logFileName)
 	
 	// 開啟或建立 log 檔案（附加模式）
@@ -488,7 +500,8 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	
 	if modTime, err := client.GetTime(remotePath); err == nil {
 		remoteTime = modTime
-		logInfo["remote_time"] = remoteTime.Format("2006-01-02 15:04:05")
+		// 轉換為本地時間顯示
+		logInfo["remote_time"] = remoteTime.Local().Format("2006-01-02 15:04:05")
 	} else {
 		// GetTime 失敗，嘗試使用 List 取得檔案資訊
 		log.Printf("WARNING: Cannot retrieve remote file time via MDTM for %s: %v", remotePath, err)
@@ -525,8 +538,9 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 				if entry.Name == remoteFileName {
 					if !entry.Time.IsZero() {
 						remoteTime = entry.Time
-						logInfo["remote_time"] = remoteTime.Format("2006-01-02 15:04:05")
-						log.Printf("✓ 成功透過 LIST 取得檔案時間: %s", remoteTime.Format("2006-01-02 15:04:05"))
+						// 轉換為本地時間顯示
+						logInfo["remote_time"] = remoteTime.Local().Format("2006-01-02 15:04:05")
+						log.Printf("✓ 成功透過 LIST 取得檔案時間: %s", remoteTime.Local().Format("2006-01-02 15:04:05"))
 					} else {
 						log.Printf("WARNING: List 回傳的檔案時間為空")
 						logInfo["remote_time"] = "無法取得"
@@ -572,14 +586,8 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 		
 		// 比對修改時間
 		if !remoteTime.IsZero() {
-			// 將遠端時間轉換為用於比對的時間
-			// 如果是 UTC，需要將同樣的時間數字當作本地時間來比對
-			compareTime := remoteTime
-			if remoteTime.Location().String() == "UTC" {
-				year, month, day := remoteTime.Date()
-				hour, min, sec := remoteTime.Clock()
-				compareTime = time.Date(year, month, day, hour, min, sec, remoteTime.Nanosecond(), time.Local)
-			}
+			// NonStop 伺服器回傳 UTC 時間，轉換成本地時間來比對
+			compareTime := remoteTime.Local()
 			
 			if compareTime.After(localInfo.ModTime()) {
 				log.Printf("🕒 遠端檔案較新: %s (本地: %s, 遠端: %s)", localName, 
@@ -670,24 +678,13 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 
 	// Set file modification time to match remote file time
 	if !remoteTime.IsZero() {
-		// 記錄原始時區資訊
-		log.Printf("🕒 遠端時間 (原始): %s (Zone: %s)", remoteTime.Format("2006-01-02 15:04:05"), remoteTime.Location())
-		
-		// 如果遠端時間是 UTC，需要將同樣的時間數字當作本地時間
-		// 例如：遠端 UTC 08:38:47 -> 本地也要顯示 08:38:47（而不是 16:38:47）
-		localTime := remoteTime
-		if remoteTime.Location().String() == "UTC" {
-			// 取得 UTC 時間的年月日時分秒，但使用本地時區
-			year, month, day := remoteTime.Date()
-			hour, min, sec := remoteTime.Clock()
-			localTime = time.Date(year, month, day, hour, min, sec, remoteTime.Nanosecond(), time.Local)
-			log.Printf("🕒 將 UTC 時間轉換為本地時區的相同時間: %s", localTime.Format("2006-01-02 15:04:05"))
-		}
+		// NonStop 伺服器回傳的是 UTC 時間，需要轉換成本地時間
+		// 這樣下載的檔案時間就會和 FileZilla 顯示的一致
+		localTime := remoteTime.Local()
+		log.Printf("🕒 設定檔案時間為: %s", localTime.Format("2006-01-02 15:04:05"))
 		
 		if err := os.Chtimes(localPath, localTime, localTime); err != nil {
 			log.Printf("⚠️  Warning: Failed to set file time for %s: %v", localPath, err)
-		} else {
-			log.Printf("🕒 已設定檔案時間")
 		}
 	}
 
@@ -701,13 +698,10 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	logInfo["final_size"] = fmt.Sprintf("%d", writtenInfo.Size())
 	logInfo["local_time_after"] = writtenInfo.ModTime().Format("2006-01-02 15:04:05")
 	logInfo["status"] = "下載成功"
-	
-	// 記錄時區資訊用於除錯
-	log.Printf("📝 本地檔案時間: %s (Zone: %s)", writtenInfo.ModTime().Format("2006-01-02 15:04:05"), writtenInfo.ModTime().Location())
 
 	log.Printf("✓ Downloaded %s to %s", remotePath, localPath)
 	if !remoteTime.IsZero() {
-		log.Printf("  Remote time: %s", remoteTime.Format("2006-01-02 15:04:05"))
+		log.Printf("  Remote time: %s", remoteTime.Local().Format("2006-01-02 15:04:05"))
 	}
 	log.Printf("  Remote size: %d bytes", remoteSize)
 	log.Printf("  Downloaded: %d bytes", rawBytesRead)
@@ -979,6 +973,8 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 
 	dialOptions := []ftp.DialOption{
 		ftp.DialWithTimeout(10 * time.Second),
+		// 不設定 DialWithLocation，讓 FTP 庫用 UTC 解析時間
+		// 然後在設定檔案時間時用 .Local() 轉換成本地時間
 	}
 
 	if cfg.UseImplicitTLS {
@@ -1045,6 +1041,20 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 		log.Println("Downloading specified files from config...")
 		for _, mapping := range cfg.FileNames {
 			basePath := strings.TrimSpace(mapping.RemotePath)
+			
+			// 檢查路徑專屬的時間範圍
+			if mapping.AllowedTimeRange != "" {
+				within, err := isWithinTimeRange(mapping.AllowedTimeRange)
+				if err != nil {
+					log.Printf("❌ 路徑 %s 的時間範圍格式錯誤: %v", basePath, err)
+					continue
+				}
+				if !within {
+					log.Printf("⏭️  跳過目錄 %s：目前時間不在允許範圍 %s 內", basePath, mapping.AllowedTimeRange)
+					continue
+				}
+				log.Printf("✅ 目錄 %s 在允許時間範圍 %s 內，執行下載", basePath, mapping.AllowedTimeRange)
+			}
 			
 			// 檢查結帳檔（針對此路徑映射）- 檢查本地是否有當天的 DATCLOSE
 			if mapping.CheckFlagFile && mapping.FlagFileName != "" {
@@ -1569,8 +1579,12 @@ func run(cfg *Config) error {
 		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 			log.Printf("Error creating log directory: %v", err)
 		} else {
-			// 清理超過 3 天的舊日誌
-			if err := cleanOldLogs(cfg.LogDir, 3); err != nil {
+			// 清理超過指定天數的舊日誌（預設 3 天）
+			keepDays := cfg.LogRetentionDays
+			if keepDays <= 0 {
+				keepDays = 3
+			}
+			if err := cleanOldLogs(cfg.LogDir, keepDays); err != nil {
 				log.Printf("⚠️  清理舊日誌時發生錯誤: %v", err)
 			}
 			

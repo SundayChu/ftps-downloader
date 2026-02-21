@@ -32,6 +32,8 @@ func loadConfig(path string) (*Config, error) {
 		CompareByModTime:   true,
 		MaxRetries:         3,
 		RetryDelay:         5,
+		LogRetentionDays:   3,
+	}
 
 	scanner := bufio.NewScanner(file)
 	fileItems := make(map[string]string)
@@ -139,6 +141,10 @@ func loadConfig(path string) (*Config, error) {
 			cfg.DebugList = (value == "true")
 		case "separate_file_log":
 			cfg.SeparateFileLog = (value == "true")
+		case "log_retention_days":
+			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+				cfg.LogRetentionDays = n
+			}
 		case "disable_mlsd":
 			cfg.DisableMLSD = (value == "true")
 		case "max_retries":

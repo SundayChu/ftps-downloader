@@ -48,6 +48,7 @@ type Config struct {
 	StopTime           string   // 自動停止時間（HH:mm）
 	DebugList          bool     // 顯示 LIST 命令的詳細輸出
 	SeparateFileLog    bool     // 為每個下載檔案建立獨立的 log 檔案
+	LogRetentionDays   int      // 日誌保留天數（包含分檔日誌）
 	DisableMLSD        bool     // 停用 MLSD，強制使用 LIST
 	MaxRetries         int      // 連線失敗重試次數
 	RetryDelay         int      // 重試延遲秒數

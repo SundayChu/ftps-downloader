@@ -108,9 +108,14 @@ check_interval=30
 #split_file_prefixes=TCD,TSC
 
 # 為每個檔案產生獨立 log (true/false，預設 false)
-# - true: 每個下載檔案會產生獨立的 .log 檔，記錄時間與大小比對資訊
+# - true: 每個下載檔案會產生獨立的 .log 檔（按日分檔），記錄時間與大小比對資訊
 # - false: 所有資訊只寫入主 log 檔
+# 啟用後，log 檔名格式為：檔名-2024-01-15.log
 #separate_file_log=false
+
+# 日誌保留天數（預設 3 天）
+# 超過此天數的日誌會自動清理，包括主日誌和分檔日誌
+#log_retention_days=3
 
 # ================================================================
 # 下載檔案清單
