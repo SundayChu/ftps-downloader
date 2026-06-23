@@ -19,20 +19,17 @@ func loadConfig(path string) (*Config, error) {
 	defer file.Close()
 
 	cfg := &Config{
-		Port:               "21",
-		LocalDir:           "./downloads",
-		FileNames:          make([]PathMapping, 0),
-		GuardianAddCRLF:    true,
-		CheckFlagFile:      false,
-		FlagFileName:       "DATCLOSE",
-		FlagFilePath:       "",
-		AutoDeleteFlagFile: true,
-		CheckInterval:      30,
-		DisableMLSD:        true,
-		CompareByModTime:   true,
-		MaxRetries:         3,
-		RetryDelay:         5,
-		LogRetentionDays:   3,
+		Port:             "21",
+		LocalDir:         "./downloads",
+		FileNames:        make([]PathMapping, 0),
+		GuardianAddCRLF:  true,
+		CheckFlagFile:    false,
+		FlagFileName:     "DATCLOSE",
+		CheckInterval:    30,
+		DisableMLSD:      true,
+		CompareByModTime: true,
+		MaxRetries:       3,
+		RetryDelay:       5,
 	}
 
 	scanner := bufio.NewScanner(file)
@@ -107,10 +104,6 @@ func loadConfig(path string) (*Config, error) {
 			cfg.CheckFlagFile = (value == "true")
 		case "flag_file_name":
 			cfg.FlagFileName = value
-		case "flag_file_path":
-			cfg.FlagFilePath = value
-		case "auto_delete_flag_file":
-			cfg.AutoDeleteFlagFile = (value == "true")
 		case "raw_download":
 			cfg.RawDownload = (value == "true")
 		case "allowed_time_range":
@@ -141,10 +134,6 @@ func loadConfig(path string) (*Config, error) {
 			cfg.DebugList = (value == "true")
 		case "separate_file_log":
 			cfg.SeparateFileLog = (value == "true")
-		case "log_retention_days":
-			if n, err := strconv.Atoi(value); err == nil && n > 0 {
-				cfg.LogRetentionDays = n
-			}
 		case "disable_mlsd":
 			cfg.DisableMLSD = (value == "true")
 		case "max_retries":
@@ -178,10 +167,6 @@ func loadConfig(path string) (*Config, error) {
 						pathMappings[pathIdx].LocalPath = value
 					} else if tokens[2] == "allowed_time_range" {
 						pathMappings[pathIdx].AllowedTimeRange = value
-					} else if tokens[2] == "check_flag_file" {
-						pathMappings[pathIdx].CheckFlagFile = (value == "true")
-					} else if tokens[2] == "flag_file_name" {
-						pathMappings[pathIdx].FlagFileName = value
 					} else if tokens[2] == "files" && len(tokens) >= 4 {
 						fileIdx, _ := strconv.Atoi(tokens[3])
 						mapKey := fmt.Sprintf("%d.%d", pathIdx, fileIdx)
@@ -251,14 +236,6 @@ func loadConfig(path string) (*Config, error) {
 					mapping.ExcludeFiles = append(mapping.ExcludeFiles, exclude)
 				}
 			}
-			
-			// 如果此映射沒有設定結帳檔名稱，則使用全局預設值
-			if mapping.FlagFileName == "" {
-				mapping.FlagFileName = cfg.FlagFileName
-			}
-			// 注意：CheckFlagFile 的預設值是 false，如果需要使用全局設定，
-			// 需要在配置檔中明確指定該路徑的 check_flag_file=true
-			
 			cfg.FileNames = append(cfg.FileNames, *mapping)
 		}
 	}

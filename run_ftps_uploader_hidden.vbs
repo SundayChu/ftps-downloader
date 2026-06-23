@@ -12,9 +12,10 @@ logsDir = scriptDir & "\logs"
 If Not fso.FolderExists(logsDir) Then
     fso.CreateFolder(logsDir)
 End If
-' Format: ftps-uploader-restart-YYYY-MM-DD.log
+
+' Format: ftps-uploader-vbs-YYYY-MM-DD.log
 logDate = Year(Now) & "-" & Right("0" & Month(Now), 2) & "-" & Right("0" & Day(Now), 2)
-logFile = logsDir & "\ftps-uploader-restart-" & logDate & ".log"
+logFile = logsDir & "\ftps-uploader-vbs-" & logDate & ".log"
 
 ' Function to write log with timestamp
 Sub WriteLog(message)
@@ -24,47 +25,32 @@ Sub WriteLog(message)
     logStream.Close
 End Sub
 
-' Clean up old log files (keep only last 3 days including today)
-Sub CleanOldLogs()
-    Dim file, cutoffDate
-    ' Keep today and 2 days before (3 days total)
-    cutoffDate = DateValue(DateAdd("d", -2, Now))
-    
-    For Each file In fso.GetFolder(logsDir).Files
-        If LCase(fso.GetExtensionName(file.Name)) = "log" Then
-            If file.DateLastModified < cutoffDate Then
-                WriteLog "Deleting old log file: " & file.Name
-                file.Delete
-            End If
-        End If
-    Next
-End Sub
+' ===================================================================
+' 注意：單一實例控制已經在 ftps-uploader.exe 中實作
+' Go 程式會自動偵測並終止已存在的實例，因此 VBS 不需要檢查
+' ===================================================================
 
-' Check if ftps-uploader.exe is already running, terminate if so
-Set objWMI = GetObject("winmgmts:\\.\root\cimv2")
-Set colProcesses = objWMI.ExecQuery("SELECT * FROM Win32_Process WHERE Name = 'ftps-uploader.exe'")
-processCount = 0
-For Each objProcess In colProcesses
-    processCount = processCount + 1
-    WriteLog "Terminating existing ftps-uploader.exe (PID: " & objProcess.ProcessId & ")"
-    objProcess.Terminate()
-Next
-Set colProcesses = Nothing
-Set objWMI = Nothing
+WriteLog "=========================================="
+WriteLog "Starting FTPS Uploader (Hidden Mode)"
+WriteLog "=========================================="
 
-If processCount > 0 Then
-    WriteLog "Terminated " & processCount & " running instance(s)"
-    ' Wait a moment for process to fully terminate
-    WScript.Sleep 500
+' Run ftps-uploader.exe directly (hidden window)
+' The Go program will handle single instance control automatically
+commandLine = """" & scriptDir & "\ftps-uploader.exe"" -config """ & scriptDir & "\config.uploader.properties"""
+WriteLog "Command: " & commandLine
+
+' Run with window style 0 (hidden), and wait for completion (True)
+returnCode = WshShell.Run(commandLine, 0, True)
+
+If returnCode = 0 Then
+    WriteLog "FTPS Uploader completed successfully (Exit code: 0)"
+Else
+    WriteLog "FTPS Uploader failed (Exit code: " & returnCode & ")"
 End If
 
-' Clean up old log files
-CleanOldLogs
+WriteLog "=========================================="
+WriteLog "VBS Script finished"
+WriteLog "=========================================="
 
-' Build and run via batch script (hidden window)
-WriteLog "Starting ftps-uploader.exe..."
-commandLine = "cmd.exe /c """ & scriptDir & "\run_ftps_uploader.bat"""
-WshShell.Run commandLine, 0, True
-WriteLog "ftps-uploader.exe execution completed"
-
-' Exit code will be returned to Task Scheduler
+' Exit with the same code as the uploader
+WScript.Quit returnCode

@@ -8,12 +8,21 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/jlaffaye/ftp"
+)
+
+var (
+	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutex  = kernel32.NewProc("CreateMutexW")
+	procGetLastError = kernel32.NewProc("GetLastError")
 )
 
 type PathMapping struct {
@@ -42,6 +51,203 @@ type Config struct {
 	CheckInterval      int    // 檢查間隔(分鐘)，預設 30 分鐘
 	MonitorMode        bool   // 是否啟用全天監控模式
 	StopTime           string // 自動停止時間，格式: "HH:mm", 例如 "18:00"
+}
+
+// cleanupOldLogs 清理超過指定天數的日誌檔案
+func cleanupOldLogs(logDir string, retentionDays int) {
+	if logDir == "" {
+		return
+	}
+
+	// 確保日誌目錄存在
+	if _, err := os.Stat(logDir); os.IsNotExist(err) {
+		return
+	}
+
+	now := time.Now()
+	cutoffTime := now.AddDate(0, 0, -retentionDays)
+
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("【日誌清理】檢查日誌目錄: %s", logDir)
+	log.Printf("保留天數: %d 天 (刪除 %s 之前的日誌)", retentionDays, cutoffTime.Format("2006-01-02"))
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		log.Printf("⚠️  無法讀取日誌目錄: %v", err)
+		return
+	}
+
+	deletedCount := 0
+	var deletedSize int64
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		fileName := entry.Name()
+		// 只處理 .log 檔案
+		if !strings.HasSuffix(strings.ToLower(fileName), ".log") {
+			continue
+		}
+
+		filePath := filepath.Join(logDir, fileName)
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// 檢查檔案修改時間
+		if info.ModTime().Before(cutoffTime) {
+			fileSize := info.Size()
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("⚠️  無法刪除: %s (%v)", fileName, err)
+			} else {
+				deletedCount++
+				deletedSize += fileSize
+				log.Printf("🗑️  已刪除: %s (修改時間: %s, 大小: %s)",
+					fileName,
+					info.ModTime().Format("2006-01-02 15:04:05"),
+					formatFileSize(fileSize))
+			}
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Printf("✓ 清理完成: 刪除 %d 個舊日誌檔案，釋放空間 %s", deletedCount, formatFileSize(deletedSize))
+	} else {
+		log.Printf("✓ 無需清理: 沒有超過 %d 天的日誌檔案", retentionDays)
+	}
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Println()
+}
+
+// formatFileSize 格式化檔案大小顯示
+func formatFileSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+// ensureSingleInstance 確保只有一個程式實例在執行
+// 使用 Windows Mutex 機制，如果檢測到已有實例在執行，會終止舊實例
+func ensureSingleInstance() error {
+	mutexName, err := syscall.UTF16PtrFromString("Global\\FTPSUploader_Mutex_Singleton")
+	if err != nil {
+		return fmt.Errorf("建立 Mutex 名稱失敗: %w", err)
+	}
+
+	// 嘗試建立 Mutex
+	ret, _, err := procCreateMutex.Call(
+		0,
+		0,
+		uintptr(unsafe.Pointer(mutexName)),
+	)
+
+	if ret == 0 {
+		return fmt.Errorf("建立 Mutex 失敗: %w", err)
+	}
+
+	// 取得 GetLastError 的值
+	lastErr, _, _ := procGetLastError.Call()
+	
+	const ERROR_ALREADY_EXISTS = 183
+
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("【執行實例檢查】")
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	if lastErr == ERROR_ALREADY_EXISTS {
+		log.Printf("⚠️  偵測到已有執行中的上傳程式實例")
+		log.Printf("正在終止舊的執行實例...")
+
+		// 查找並終止已存在的 ftps-uploader.exe 程式
+		if err := killExistingProcess(); err != nil {
+			log.Printf("❌ 無法終止舊實例: %v", err)
+			log.Printf("請手動關閉其他執行中的上傳程式後重試")
+			return fmt.Errorf("已有程式實例在執行中，且無法自動終止")
+		}
+
+		log.Printf("✓ 舊實例已終止，繼續執行新程式")
+		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		log.Println()
+
+		// 等待一下確保舊程式完全結束
+		time.Sleep(2 * time.Second)
+	} else {
+		log.Printf("✓ 沒有其他執行中的實例，程式正常啟動")
+		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		log.Println()
+	}
+
+	return nil
+}
+
+// killExistingProcess 查找並終止已存在的 ftps-uploader.exe 程式（排除自己）
+func killExistingProcess() error {
+	// 取得當前程式的 PID
+	currentPID := os.Getpid()
+
+	// 使用 tasklist 查找所有名為 ftps-uploader.exe 的程式
+	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq ftps-uploader.exe", "/FO", "CSV", "/NH")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("執行 tasklist 失敗: %w", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	killedCount := 0
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// CSV 格式: "程式名稱","PID","工作階段名稱","工作階段#","記憶體使用量"
+		// 範例: "ftps-uploader.exe","12345","Console","1","10,240 K"
+		fields := strings.Split(line, ",")
+		if len(fields) < 2 {
+			continue
+		}
+
+		// 移除引號並取得 PID
+		pidStr := strings.Trim(fields[1], "\" ")
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			continue
+		}
+
+		// 不要終止自己
+		if pid == currentPID {
+			continue
+		}
+
+		// 終止該程式
+		log.Printf("🔫 終止程式 PID: %d", pid)
+		killCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
+		if err := killCmd.Run(); err != nil {
+			log.Printf("⚠️  無法終止 PID %d: %v", pid, err)
+		} else {
+			killedCount++
+			log.Printf("✓ 已終止 PID: %d", pid)
+		}
+	}
+
+	if killedCount == 0 {
+		// 雖然 Mutex 顯示有實例，但可能剛好結束了
+		log.Printf("ℹ️  未找到需要終止的程式實例")
+		return nil
+	}
+
+	return nil
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -921,6 +1127,7 @@ func main() {
 	// Setup logging with timestamp and file info
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
+	// 先載入設定檔以取得日誌目錄設定
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
@@ -928,6 +1135,7 @@ func main() {
 	}
 
 	// Setup log file - ensure logs directory exists
+	var logFile *os.File
 	if cfg.LogDir != "" {
 		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create log directory: %v\n", err)
@@ -939,6 +1147,7 @@ func main() {
 			isNewFile := fileInfo == nil || fileInfo.Size() == 0
 			f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
+				logFile = f
 				// Write UTF-8 BOM for new files so Windows Notepad can detect UTF-8
 				if isNewFile {
 					f.Write([]byte{0xEF, 0xBB, 0xBF})
@@ -950,7 +1159,6 @@ func main() {
 				} else {
 					log.SetOutput(f)
 				}
-				defer f.Close()
 			} else {
 				fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
 			}
@@ -962,9 +1170,29 @@ func main() {
 	log.Printf("FTPS Uploader started")
 	log.Printf("Config file: %s", *configPath)
 	log.Printf("========================================")
+	log.Println()
+
+	// 1. 確保單一執行實例（終止舊實例）
+	if err := ensureSingleInstance(); err != nil {
+		log.Printf("❌ 執行實例檢查失敗: %v", err)
+		if logFile != nil {
+			logFile.Close()
+		}
+		os.Exit(1)
+	}
+
+	// 2. 清理超過3天的舊日誌
+	if cfg.LogDir != "" {
+		cleanupOldLogs(cfg.LogDir, 3)
+	}
 
 	// Run the upload process
 	err = run(cfg)
+
+	// Close log file if opened
+	if logFile != nil {
+		logFile.Close()
+	}
 
 	// Log execution result
 	log.Printf("========================================")

@@ -1,191 +1,94 @@
-# ================================================================
-# FTPS Uploader 標準設定檔
-# ================================================================
+# FTPS Uploader 設定檔範例
 
-# ================================================================
-# 基本連線設定
-# ================================================================
-# FTPS 伺服器位址
+# FTPS 伺服器設定
 host=192.168.27.22
-
-# 連接埠 (21=Explicit TLS, 990=Implicit TLS)
 port=8421
-
-# 登入帳號
 user=MLS.OP200
-
-# 登入密碼
 pass=CMAKE#96
 
-# ================================================================
 # 目錄設定
-# ================================================================
 # 遠端上傳目錄 (選填)
 remote_dir=
-
 # 本地讀取目錄
 local_dir=./uploads
-
-# 日誌檔目錄 (選填，留空則只輸出到螢幕)
+# 日誌檔目錄
 log_dir=./logs
 
-# ================================================================
 # TLS 設定
-# ================================================================
-# 是否使用 Implicit TLS (通常使用 port 990)
 use_implicit_tls=false
-
-# 是否跳過 SSL 憑證驗證 (測試環境可設為 true)
 insecure_skip_verify=true
 
-# ================================================================
-# 時間設定
-# ================================================================
-# 允許上傳的時間範圍（格式：HH:mm-HH:mm）
-# 例如 "02:00-05:00" 表示只在凌晨 2-5 點上傳
-# 支援跨午夜，例如 "22:00-04:00"
-# 不設定則任何時間都可上傳
+# 上傳時間限制 (選填)
+# 格式: HH:mm-HH:mm
+# 只有在指定時間範圍內才會執行上傳，否則會直接結束
 #allowed_time_range=02:00-05:00
 
-# ================================================================
-# 檔案上傳規則
-# ================================================================
-# 
+# ========================================
+# 檔案上傳規則說明
+# ========================================
 # 支援多種方式指定要上傳的檔案：
 #
 # 1. files: 明確指定檔案名稱
-#    file_names.索引.files.編號=本地檔名[:遠端檔名]
+#    格式: file_names.索引.files.編號=本地檔名[:遠端檔名]
+#    範例: file_names.0.files.0=RYM01
+#          file_names.0.files.1=RYM02:RYM02_RENAMED
 #
 # 2. patterns: 使用萬用字元匹配檔案
-#    file_names.索引.patterns.編號=萬用字元模式
-#    萬用字元: * (多個字元), ? (單一字元)
+#    格式: file_names.索引.patterns.編號=萬用字元模式
+#    範例: file_names.0.patterns.0=*.txt      (所有 .txt 檔案)
+#          file_names.0.patterns.1=TCD*       (TCD 開頭的檔案)
+#          file_names.0.patterns.2=RYM??      (RYM 後接兩個字元)
 #
 # 3. include_prefixes: 只上傳符合前綴的檔案
-#    file_names.索引.include_prefixes.編號=前綴
+#    格式: file_names.索引.include_prefixes.編號=前綴
+#    範例: file_names.0.include_prefixes.0=TCD
+#          file_names.0.include_prefixes.1=TSC
 #
 # 4. include_suffixes: 只上傳符合後綴的檔案
-#    file_names.索引.include_suffixes.編號=後綴
+#    格式: file_names.索引.include_suffixes.編號=後綴
+#    範例: file_names.0.include_suffixes.0=.txt
+#          file_names.0.include_suffixes.1=.dat
 #
 # 5. exclude_files: 排除特定檔案
-#    file_names.索引.exclude_files.編號=檔案名稱
-#
-# 6. rename_prefix: 批次前綴重命名
-#    file_names.索引.rename_prefix.編號=舊前綴:新前綴
-#
-# 7. rename_suffix: 批次後綴重命名/添加副檔名
-#    file_names.索引.rename_suffix.編號=舊後綴:新後綴
-#    (舊後綴用空字符 ":" 表示為所有檔案添加後綴)
+#    格式: file_names.索引.exclude_files.編號=檔案名稱
+#    範例: file_names.0.exclude_files.0=test.txt
+#          file_names.0.exclude_files.1=backup.dat
 #
 # 注意事項：
 # - 可以同時使用多種規則，系統會自動合併結果
 # - 排除規則優先級最高（exclude_files）
 # - 前綴和後綴規則可以組合使用（必須同時符合）
-# ================================================================
-
-# ================================================================
-# 上傳檔案設定範例
-# ================================================================
+# - 萬用字元支援: * (多個字元), ? (單一字元)
+# ========================================
 
 # 範例 1: 明確指定檔案
-file_names.0.local_path=./uploads
+file_names.0.local_path=./downloads
 file_names.0.files.0=RYM01
-file_names.0.files.1=RYM02:RYM02_RENAMED
+file_names.0.files.1=RYM02:RYM02_UPLOADED
 
 # 範例 2: 使用萬用字元上傳所有 TCD 和 TSC 開頭的檔案
-#file_names.1.local_path=./uploads
+#file_names.1.local_path=./downloads
 #file_names.1.patterns.0=TCD*
 #file_names.1.patterns.1=TSC*
 
 # 範例 3: 只上傳 .txt 檔案
-#file_names.2.local_path=./uploads
+#file_names.2.local_path=./downloads
 #file_names.2.patterns.0=*.txt
 
-# 範例 4: 使用前綴篩選（只上傳 TCD 和 TSC 開頭的檔案）
-#file_names.3.local_path=./uploads
+# 範例 4: 使用前綴篩選（自動掃描目錄，只上傳符合前綴的檔案）
+#file_names.3.local_path=./downloads
 #file_names.3.include_prefixes.0=TCD
 #file_names.3.include_prefixes.1=TSC
 #file_names.3.include_suffixes.0=.5920  # 可選：同時限制後綴
 
 # 範例 5: 上傳所有檔案，但排除特定檔案
-#file_names.4.local_path=./uploads
+#file_names.4.local_path=./downloads
 #file_names.4.patterns.0=*
 #file_names.4.exclude_files.0=test.txt
 #file_names.4.exclude_files.1=backup.dat
 
 # 範例 6: 組合使用（只上傳 TCD 開頭且為 .txt 的檔案，但排除 TCD_TEST.txt）
-#file_names.5.local_path=./uploads
+#file_names.5.local_path=./downloads
 #file_names.5.include_prefixes.0=TCD
 #file_names.5.include_suffixes.0=.txt
 #file_names.5.exclude_files.0=TCD_TEST.txt
-
-# 範例 7: 前綴篩選 + 批次前綴重命名
-# 上傳所有 TCD 開頭的檔案，並將前綴改為 DATA
-#file_names.6.local_path=./uploads
-#file_names.6.include_prefixes.0=TCD
-#file_names.6.rename_prefix.0=TCD:DATA
-
-# 範例 8: 多前綴篩選 + 各別重命名
-# 不同前綴使用不同的新名稱
-#file_names.7.local_path=./uploads
-#file_names.7.include_prefixes.0=TCD
-#file_names.7.include_prefixes.1=TSC
-#file_names.7.include_prefixes.2=RYM
-#file_names.7.rename_prefix.0=TCD:DATA
-#file_names.7.rename_prefix.1=TSC:INFO
-#file_names.7.rename_prefix.2=RYM:REPORT
-
-# 範例 9: 後綴篩選 + 後綴重命名
-# 上傳所有 .txt 檔案，改為 .dat
-#file_names.8.local_path=./uploads
-#file_names.8.include_suffixes.0=.txt
-#file_names.8.rename_suffix.0=.txt:.dat
-
-# 範例 10: 前後綴篩選 + 雙重重命名
-# 同時改前綴和後綴
-#file_names.9.local_path=./uploads
-#file_names.9.include_prefixes.0=TCD
-#file_names.9.include_suffixes.0=.txt
-#file_names.9.rename_prefix.0=TCD:DATA
-#file_names.9.rename_suffix.0=.txt:.dat
-#file_names.9.exclude_files.0=TCD_TEST.txt
-
-# 範例 11: 為無副檔名的檔案批次添加副檔名
-# 上傳 RYM 開頭的檔案（無副檔名），統一添加 .dat 副檔名
-# 使用空字符串作為舊後綴，表示為所有檔案添加後綴
-#file_names.10.local_path=./uploads
-#file_names.10.include_prefixes.0=RYM
-#file_names.10.rename_suffix.0=:.dat
-# 效果: RYM01 → RYM01.dat, RYM02 → RYM02.dat
-
-# 範例 12: 前綴改名 + 添加副檔名
-# 同時改前綴和添加副檔名
-#file_names.11.local_path=./uploads
-#file_names.11.include_prefixes.0=TCD
-#file_names.11.rename_prefix.0=TCD:DATA
-#file_names.11.rename_suffix.0=:.txt
-# 效果: TCD5920 → DATA5920.txt
-
-# ================================================================
-# 使用說明
-# ================================================================
-# 
-# 【一般使用】
-# 1. 複製此檔案為 config.uploader.properties
-# 2. 修改連線設定 (host, user, pass)
-# 3. 設定本地目錄和檔案上傳規則
-# 4. 執行: ftps-uploader.exe
-#
-# 【時間限制】
-# 1. 設定 allowed_time_range=02:00-05:00
-# 2. 只在指定時間內執行上傳
-# 3. 搭配排程器每天定時執行
-#
-# 【背景執行】
-# 1. 使用 run_ftps_uploader_hidden.vbs 背景執行
-# 2. 避免顯示控制台視窗
-#
-# 詳細說明請參考:
-# - README.md
-# - UPLOADER_FILTER_GUIDE.md
-# - PREFIX_RENAME_GUIDE.md
-# ================================================================

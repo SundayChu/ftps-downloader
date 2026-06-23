@@ -29,13 +29,24 @@ local_dir=./downloads
 # 日誌檔目錄 (選填，留空則只輸出到螢幕)
 log_dir=./logs
 
+# 記錄檔案原始時間的資料夾
+# 用於比對遠端檔案是否更新，每個檔案會產生一個 txt 記錄遠端時間
+file_times_dir=./file_times
+
 # ================================================================
-# TLS 設定
+# TLS / 連線模式設定
 # ================================================================
+# 是否啟用 TLS 加密（FTPS）
+# true  = 使用 FTPS（預設，安全）
+# false = 使用純文字 FTP（無加密）
+use_tls=true
+
 # 是否使用 Implicit TLS (通常使用 port 990)
+# 只在 use_tls=true 時有效
 use_implicit_tls=false
 
 # 是否跳過 SSL 憑證驗證 (測試環境可設為 true)
+# 只在 use_tls=true 時有效
 insecure_skip_verify=true
 
 # ================================================================
@@ -62,6 +73,34 @@ check_interval=30
 #stop_time=18:00
 
 # ================================================================
+# 調試與日誌設定
+# ================================================================
+# 是否顯示 LIST 命令輸出（檔案清單詳情）
+# true: 顯示完整的 FTP LIST 響應（用於調試）
+# false: 隱藏 LIST 輸出（預設，避免日誌過於冗長）
+debug_list=false
+
+# 是否停用 MLSD，強制使用 LIST（NonStop 伺服器建議 true）
+disable_mlsd=true
+
+# 是否為每個下載的檔案建立獨立的日誌
+# true: 在 logs/ 目錄下為每個檔案建立 download_<filename>_<timestamp>.log
+# false: 所有下載記錄寫入主日誌檔案
+separate_file_log=true
+
+# 是否輸出編碼調試資訊
+#debug_encoding=false
+
+# ================================================================
+# 連線重試設定
+# ================================================================
+# 連線失敗時的重試次數（預設 3 次）
+max_retries=3
+
+# 重試延遲秒數（預設 5 秒）
+retry_delay=5
+
+# ================================================================
 # 編碼設定 (用於 Guardian/NonStop 等特殊系統)
 # ================================================================
 # 來源檔案編碼
@@ -70,9 +109,6 @@ check_interval=30
 
 # 目標檔案編碼
 #target_encoding=
-
-# 是否輸出編碼調試資訊
-#debug_encoding=false
 
 # 跳過檔案開頭的字節數
 # - 正數: 跳過指定字節數
@@ -90,32 +126,42 @@ check_interval=30
 # ================================================================
 # 檔案下載設定
 # ================================================================
-# 結帳檔設定（DATCLOSE 機制）
-# 結帳檔名稱
+# 旗標檔案檢查（結帳檔檢查）
+# true: 下載前先檢查指定的旗標檔案是否存在
+# false: 不進行旗標檔案檢查，直接下載
+# 注意：旗標檔案不存在時，會跳過所有下載作業
+#check_flag_file=false
 #flag_file_name=DATCLOSE
 
-# 結帳檔專用下載路徑（程式會先從這個路徑下載 DATCLOSE）
-# 例如：\CSTP96.$DATA.SKWORK
-#flag_file_path=\CSTP96.$DATA.SKWORK
-
-# 下載完成後自動刪除 DATCLOSE（預設 true）
-#auto_delete_flag_file=true
-
-# 結帳檔檢查（全局設定，將被棄用，建議在各路徑中獨立設定）
-#check_flag_file=false
-
 # 檔案分割設定（針對特定前綴的檔案）
+# 會根據每筆資料的前四碼自動分類儲存
 #split_file_prefixes=TCD,TSC
 
-# 為每個檔案產生獨立 log (true/false，預設 false)
-# - true: 每個下載檔案會產生獨立的 .log 檔（按日分檔），記錄時間與大小比對資訊
-# - false: 所有資訊只寫入主 log 檔
-# 啟用後，log 檔名格式為：檔名-2024-01-15.log
-#separate_file_log=false
+# ================================================================
+# 智慧下載設定 🆕
+# ================================================================
+# 下載選項優先級（由高到低）：
+# 1. force_download=true → 總是下載，忽略所有檢查
+# 2. skip_if_exists=true → 本地檔案存在就跳過
+# 3. compare_by_modtime → 比對修改時間或檔案大小
+#
+# 強制下載所有檔案（忽略本地檔案狀態）
+# 注意：此選項優先級最高，會覆蓋 skip_if_exists 設定
+# true: 強制下載所有檔案
+# false: 依照 skip_if_exists 設定決定
+#force_download=false
 
-# 日誌保留天數（預設 3 天）
-# 超過此天數的日誌會自動清理，包括主日誌和分檔日誌
-#log_retention_days=3
+# 是否啟用智慧下載（檢查本地檔案，只下載不存在或較新的檔案）
+# true: 啟用智慧下載，本地檔案存在就跳過（不比對內容）
+# false: 每次都重新下載所有檔案（預設）
+skip_if_exists=false
+
+# 比對方式選擇（僅當 skip_if_exists=false 且 force_download=false 時生效）
+# true: 使用修改時間比對（需要伺服器支援 MDTM 或 LIST 命令）
+#       - 無法取得時間時會強制下載以確保完整性
+# false: 使用檔案大小比對（相容性較好，適合大多數場景）
+#        - 無法取得大小時會強制下載以確保完整性
+compare_by_modtime=true
 
 # ================================================================
 # 下載檔案清單
@@ -162,14 +208,6 @@ file_names.0.files.1=RYM02
 #file_names.3.remote_path=\\CSTP96.$DATA.SKDATA91
 #file_names.3.exclude_files.0=test
 #file_names.3.exclude_files.1=backup
-
-# 範例 5: 針對特定路徑啟用結帳檔檢查（檢查本地 DATCLOSE）
-# 注意：這會檢查本地是否有當天的 DATCLOSE，而非遠端
-#file_names.4.remote_path=\\CSTP96.$DATA.SKINTER1
-#file_names.4.check_flag_file=true
-#file_names.4.flag_file_name=DATCLOSE
-#file_names.4.files.0=BONDW
-#file_names.4.files.1=TCD5920
 
 # ================================================================
 # 使用說明

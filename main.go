@@ -314,6 +314,14 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 
 	// 直接覆寫檔案，不保留備份
 	localPath := filepath.Join(cfg.LocalDir, localName)
+	if remoteSize, err := client.FileSize(remotePath); err == nil {
+		if remoteSize == 0 {
+			log.Printf("  ⊘ Remote file size is 0 bytes, skipping download")
+			return false, nil
+		}
+	} else {
+		log.Printf("  Warning: unable to pre-check remote file size for %s: %v", remotePath, err)
+	}
 
 	remoteSize := int64(-1)
 	if size, err := client.FileSize(remotePath); err == nil {
@@ -1716,7 +1724,7 @@ func run(cfg *Config) error {
 		for {
 			// 檢查是否應該停止
 			if shouldStop, reason := shouldStopNow(cfg); shouldStop {
-				log.Printf(reason)
+				log.Print(reason)
 				return nil
 			}
 
@@ -1734,7 +1742,7 @@ func run(cfg *Config) error {
 
 			// 再次檢查是否應該停止
 			if shouldStop, reason := shouldStopNow(cfg); shouldStop {
-				log.Printf(reason)
+				log.Print(reason)
 				return nil
 			}
 

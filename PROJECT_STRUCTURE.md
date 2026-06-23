@@ -71,7 +71,8 @@ ftps-downloader/
 │   └── 【上傳器相關】
 │       ├── UPLOADER_FILTER_GUIDE.md     # 上傳器篩選功能
 │       ├── UPLOADER_HIDDEN_GUIDE.md     # 上傳器背景執行
-│       └── PREFIX_RENAME_GUIDE.md       # 檔案重命名功能
+│       ├── PREFIX_RENAME_GUIDE.md       # 檔案重命名功能
+│       └── UPLOADER_AUTO_CLEANUP_GUIDE.md  # 自動清理與單一實例功能 🆕
 │
 ├── 📁 資料目錄
 │   ├── downloads/                       # 下載的檔案存放處

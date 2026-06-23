@@ -256,10 +256,13 @@ nssm start FTPSDownloader
 - [監控模式設定範例](config.monitor.example.properties) - 監控模式專用設定檔
 - [下載器篩選指南](DOWNLOADER_FILTER_GUIDE.md) - 檔案篩選功能說明
 - [上傳器使用指南](UPLOADER_FILTER_GUIDE.md) - 上傳器功能說明
+- [上傳器自動清理指南](UPLOADER_AUTO_CLEANUP_GUIDE.md) - 日誌自動清理與單一實例控制 🆕
 
 ## 注意事項
 
 *   請確保防火牆允許程式連線到 FTP 伺服器的 Port (通常是 21 或 990，以及被動模式的 Data Ports)。
 *   本程式預設使用被動模式 (PASV) 進行資料傳輸。
 *   監控模式會持續運行，建議搭配日誌記錄功能，並定期清理舊日誌檔案。
+*   上傳器啟動時會自動清理超過 3 天的舊日誌，保持日誌目錄整潔。🆕
+*   上傳器會自動偵測並終止已存在的執行實例，確保同時只有一個程式在執行。🆕
 *   時間範圍檢查基於本機系統時間，請確保系統時間正確。

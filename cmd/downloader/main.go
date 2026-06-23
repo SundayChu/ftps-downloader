@@ -10,10 +10,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/jlaffaye/ftp"
 	"golang.org/x/text/encoding"
@@ -21,6 +24,12 @@ import (
 	"golang.org/x/text/encoding/traditionalchinese"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
+)
+
+var (
+	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutex  = kernel32.NewProc("CreateMutexW")
+	procGetLastError = kernel32.NewProc("GetLastError")
 )
 
 type PathMapping struct {
@@ -39,7 +48,9 @@ type Config struct {
 	RemoteDir          string
 	LocalDir           string
 	LogDir             string
+	FileTimesDir       string // 記錄檔案原始時間的資料夾
 	FileNames          []PathMapping
+	UseTLS             bool // 是否使用 TLS（false = 純文字 FTP，true = FTPS）
 	UseImplicitTLS     bool
 	InsecureSkipVerify bool
 	SourceEncoding     string
@@ -209,7 +220,7 @@ func stripGuardianBlocks(data []byte) ([]byte, bool) {
 		// Extract actual data between header and first-free marker
 		dataStart := headerSize
 		dataEnd := firstFree
-		
+
 		if dataEnd > dataStart {
 			output.Write(block[dataStart:dataEnd])
 			converted = true
@@ -254,7 +265,9 @@ func loadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		Port:               "21",
 		LocalDir:           "./downloads",
+		FileTimesDir:       "./file_times",
 		FileNames:          make([]PathMapping, 0),
+		UseTLS:             true,
 		GuardianAddCRLF:    true,
 		FlagFileName:       "DATCLOSE",
 		AutoDeleteFlagFile: true,
@@ -276,15 +289,15 @@ func loadConfig(path string) (*Config, error) {
 		}
 
 		key := strings.TrimSpace(parts[0])
-	value := strings.TrimSpace(parts[1])
-	
-	// Remove inline comments (space + # or space + //)
-	if idx := strings.Index(value, " #"); idx >= 0 {
-		value = strings.TrimSpace(value[:idx])
-	}
-	if idx := strings.Index(value, " //"); idx >= 0 {
-		value = strings.TrimSpace(value[:idx])
-	}
+		value := strings.TrimSpace(parts[1])
+
+		// Remove inline comments (space + # or space + //)
+		if idx := strings.Index(value, " #"); idx >= 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
+		if idx := strings.Index(value, " //"); idx >= 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
 
 		switch key {
 		case "host":
@@ -301,6 +314,8 @@ func loadConfig(path string) (*Config, error) {
 			cfg.LocalDir = value
 		case "log_dir":
 			cfg.LogDir = value
+		case "use_tls":
+			cfg.UseTLS = (value == "true")
 		case "use_implicit_tls":
 			cfg.UseImplicitTLS = (value == "true")
 		case "insecure_skip_verify":
@@ -353,6 +368,8 @@ func loadConfig(path string) (*Config, error) {
 			cfg.FlagFilePath = value
 		case "auto_delete_flag_file":
 			cfg.AutoDeleteFlagFile = (value == "true")
+		case "file_times_dir":
+			cfg.FileTimesDir = value
 		default:
 			if strings.HasPrefix(key, "file_names.") {
 				tokens := strings.Split(key, ".")
@@ -392,6 +409,22 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Resolve relative directories against the config file location so
+	// behavior stays consistent no matter where the process is launched from.
+	if absConfigPath, err := filepath.Abs(path); err == nil {
+		configDir := filepath.Dir(absConfigPath)
+
+		if cfg.LocalDir != "" && !filepath.IsAbs(cfg.LocalDir) {
+			cfg.LocalDir = filepath.Clean(filepath.Join(configDir, cfg.LocalDir))
+		}
+		if cfg.LogDir != "" && !filepath.IsAbs(cfg.LogDir) {
+			cfg.LogDir = filepath.Clean(filepath.Join(configDir, cfg.LogDir))
+		}
+		if cfg.FileTimesDir != "" && !filepath.IsAbs(cfg.FileTimesDir) {
+			cfg.FileTimesDir = filepath.Clean(filepath.Join(configDir, cfg.FileTimesDir))
+		}
+	}
+
 	maxIdx := len(pathMappings) + 10
 	for pathIdx := 0; pathIdx < maxIdx; pathIdx++ {
 		if mapping, exists := pathMappings[pathIdx]; exists && mapping != nil {
@@ -401,14 +434,14 @@ func loadConfig(path string) (*Config, error) {
 					mapping.Files = append(mapping.Files, fileName)
 				}
 			}
-			
+
 			// 如果此映射沒有設定結帳檔名稱，則使用全局預設值
 			if mapping.FlagFileName == "" {
 				mapping.FlagFileName = cfg.FlagFileName
 			}
 			// 注意：CheckFlagFile 的預設值是 false，如果需要使用全局設定，
 			// 需要在配置檔中明確指定該路徑的 check_flag_file=true
-			
+
 			cfg.FileNames = append(cfg.FileNames, *mapping)
 		}
 	}
@@ -416,38 +449,117 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// getRecordedFileTime 從 txt 檔案讀取記錄的遠端檔案時間
+// 返回讀取到的時間，如果檔案不存在或讀取失敗則返回 zero time
+func getRecordedFileTime(cfg *Config, fileName string) (time.Time, error) {
+	if cfg.FileTimesDir == "" {
+		return time.Time{}, nil
+	}
+
+	// 如果檔名已經以 .txt 結尾，就不再添加
+	timeFileName := fileName
+	if !strings.HasSuffix(strings.ToLower(fileName), ".txt") {
+		timeFileName = fileName + ".txt"
+	}
+	timeFilePath := filepath.Join(cfg.FileTimesDir, timeFileName)
+
+	data, err := os.ReadFile(timeFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil // 檔案不存在，返回 zero time
+		}
+		return time.Time{}, err
+	}
+
+	timeStr := strings.TrimSpace(string(data))
+	if timeStr == "" {
+		return time.Time{}, nil
+	}
+
+	// 嘗試解析時間（格式: 2006-01-02 15:04:05）
+	parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse time from %s: %w", timeFilePath, err)
+	}
+
+	return parsedTime, nil
+}
+
+// saveRecordedFileTime 將遠端檔案時間寫入 txt 檔案
+func saveRecordedFileTime(cfg *Config, fileName string, remoteTime time.Time) error {
+	if cfg.FileTimesDir == "" {
+		return nil
+	}
+
+	// 確保目錄存在
+	if err := os.MkdirAll(cfg.FileTimesDir, 0755); err != nil {
+		return fmt.Errorf("create file times directory: %w", err)
+	}
+
+	// 如果檔名已經以 .txt 結尾，就不再添加
+	timeFileName := fileName
+	if !strings.HasSuffix(strings.ToLower(fileName), ".txt") {
+		timeFileName = fileName + ".txt"
+	}
+	timeFilePath := filepath.Join(cfg.FileTimesDir, timeFileName)
+
+	// 將時間轉換為本地時間後寫入
+	timeStr := remoteTime.Local().Format("2006-01-02 15:04:05")
+
+	if err := os.WriteFile(timeFilePath, []byte(timeStr), 0644); err != nil {
+		return fmt.Errorf("write time file %s: %w", timeFilePath, err)
+	}
+
+	log.Printf("📝 已記錄檔案時間: %s -> %s", fileName, timeStr)
+
+	return nil
+}
+
+// parseRemotePath 解析遠端路徑，回傳 (目錄, 檔名)
+func parseRemotePath(remotePath string) (string, string) {
+	if strings.Contains(remotePath, "\\") {
+		// Guardian/NonStop 路徑格式: \CSTP96.$DATA.SKDATA91.FILENAME
+		lastDot := strings.LastIndex(remotePath, ".")
+		if lastDot > 0 {
+			return remotePath[:lastDot], remotePath[lastDot+1:]
+		}
+		return remotePath, ""
+	}
+	return filepath.Dir(remotePath), filepath.Base(remotePath)
+}
+
 // writeFileLog 寫入獨立的檔案下載 log
 func writeFileLog(cfg *Config, localName string, info map[string]string) error {
 	if !cfg.SeparateFileLog {
 		return nil
 	}
-	
+
 	logDir := cfg.LogDir
 	if logDir == "" {
 		logDir = "logs"
 	}
-	
+
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return fmt.Errorf("create log directory: %w", err)
 	}
-	
+
 	// 產生 log 檔案名稱：原檔名-日期.log（分天記錄）
 	today := time.Now().Format("2006-01-02")
 	logFileName := fmt.Sprintf("%s-%s.log", localName, today)
 	logPath := filepath.Join(logDir, logFileName)
-	
+
 	// 開啟或建立 log 檔案（附加模式）
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
 	}
 	defer f.Close()
-	
+
 	// 寫入日誌
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	fmt.Fprintf(f, "\n========================================\n")
 	fmt.Fprintf(f, "下載時間: %s\n", timestamp)
-	
+
 	if remoteTime, ok := info["remote_time"]; ok {
 		fmt.Fprintf(f, "遠端檔案時間: %s\n", remoteTime)
 	}
@@ -475,29 +587,56 @@ func writeFileLog(cfg *Config, localName string, info map[string]string) error {
 	if status, ok := info["status"]; ok {
 		fmt.Fprintf(f, "狀態: %s\n", status)
 	}
-	
+
 	fmt.Fprintf(f, "========================================\n")
-	
+
 	return nil
 }
 
 func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName string) (bool, error) {
 	localPath := filepath.Join(cfg.LocalDir, localName)
-	
+
 	// 準備 log 資訊
 	logInfo := make(map[string]string)
-	
+
 	// 取得遠端檔案資訊
 	remoteSize := int64(-1)
 	var remoteTime time.Time
-	
+
 	if size, err := client.FileSize(remotePath); err == nil {
 		remoteSize = size
 		logInfo["remote_size"] = fmt.Sprintf("%d", remoteSize)
+		log.Printf("  📊 遠端檔案大小: %d bytes", remoteSize)
 	} else {
-		log.Printf("WARNING: Cannot retrieve remote file size for %s: %v", remotePath, err)
+		log.Printf("WARNING: 無法以 SIZE 命令取得遠端檔案大小 %s: %v，嘗試使用 LIST...", remotePath, err)
+		// NonStop 伺服器不支援 SIZE 命令，改用 LIST 取得
+		remoteDir, remoteFileName := parseRemotePath(remotePath)
+		if entries, listErr := client.List(remoteDir); listErr == nil {
+			for _, entry := range entries {
+				if entry.Name == remoteFileName {
+					remoteSize = int64(entry.Size)
+					logInfo["remote_size"] = fmt.Sprintf("%d", remoteSize)
+					log.Printf("  📊 遠端檔案大小 (via LIST): %d bytes", remoteSize)
+					break
+				}
+			}
+		}
+		if remoteSize == -1 {
+			logInfo["remote_size"] = "無法取得"
+			log.Printf("WARNING: LIST 也無法取得遠端檔案大小: %s", remotePath)
+		}
 	}
-	
+
+	if remoteSize == 0 {
+		log.Printf("  ⊘ 跳過下載 %s：遠端檔案大小為 0 bytes，不進行下載", localName)
+		logInfo["status"] = "skipped"
+		logInfo["reason"] = "遠端檔案大小為 0 bytes，跳過下載"
+		if err := writeFileLog(cfg, localName, logInfo); err != nil {
+			log.Printf("Warning: Failed to write file log for %s: %v", localName, err)
+		}
+		return false, nil
+	}
+
 	if modTime, err := client.GetTime(remotePath); err == nil {
 		remoteTime = modTime
 		// 轉換為本地時間顯示
@@ -506,30 +645,11 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 		// GetTime 失敗，嘗試使用 List 取得檔案資訊
 		log.Printf("WARNING: Cannot retrieve remote file time via MDTM for %s: %v", remotePath, err)
 		log.Printf("嘗試使用 LIST 命令取得檔案時間...")
-		
-		// 處理路徑：Guardian/NonStop 使用反斜線，需要特殊處理
-		var remoteDir, remoteFileName string
-		if strings.Contains(remotePath, "\\") {
-			// Guardian/NonStop 路徑格式: \CSTP96.$DATA.SKDATA91.RYM06
-			// 目錄是最後一個點之前的部分
-			lastDot := strings.LastIndex(remotePath, ".")
-			if lastDot > 0 {
-				remoteDir = remotePath[:lastDot]
-				remoteFileName = remotePath[lastDot+1:]
-			} else {
-				// 沒有點，整個路徑就是目錄
-				remoteDir = remotePath
-				remoteFileName = ""
-			}
-		} else {
-			// Unix 風格路徑
-			remoteDir = filepath.Dir(remotePath)
-			remoteFileName = filepath.Base(remotePath)
-		}
-		
+
+		remoteDir, remoteFileName := parseRemotePath(remotePath)
 		log.Printf("嘗試列出目錄: %s", remoteDir)
 		log.Printf("尋找檔案: %s", remoteFileName)
-		
+
 		// 列出目錄
 		if entries, listErr := client.List(remoteDir); listErr == nil {
 			log.Printf("LIST 成功，找到 %d 個項目", len(entries))
@@ -544,6 +664,12 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 					} else {
 						log.Printf("WARNING: List 回傳的檔案時間為空")
 						logInfo["remote_time"] = "無法取得"
+					}
+					// 同時從 LIST 更新檔案大小（若 SIZE 命令之前也失敗）
+					if remoteSize == -1 {
+						remoteSize = int64(entry.Size)
+						logInfo["remote_size"] = fmt.Sprintf("%d", remoteSize)
+						log.Printf("  📊 遠端檔案大小 (via LIST): %d bytes", remoteSize)
 					}
 					break
 				}
@@ -566,42 +692,60 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 			logInfo["remote_time"] = "無法取得"
 		}
 	}
-	
+
 	// 檢查本地檔案是否存在
 	var downloadReason string
 	if localInfo, err := os.Stat(localPath); err == nil {
 		// 記錄本地檔案的原始狀態
 		logInfo["local_time_before"] = localInfo.ModTime().Format("2006-01-02 15:04:05")
 		logInfo["local_size_before"] = fmt.Sprintf("%d", localInfo.Size())
-		
+
 		// 本地檔案存在，比對是否需要更新
 		needDownload := false
-		
+
 		// 比對檔案大小
 		if remoteSize > 0 && localInfo.Size() != remoteSize {
 			log.Printf("📊 檔案大小不同: %s (本地: %d bytes, 遠端: %d bytes)", localName, localInfo.Size(), remoteSize)
 			needDownload = true
 			downloadReason = fmt.Sprintf("檔案大小不同 (本地: %d bytes, 遠端: %d bytes)", localInfo.Size(), remoteSize)
 		}
-		
-		// 比對修改時間
+
+		// 比對修改時間（使用 txt 記錄的時間）
 		if !remoteTime.IsZero() {
-			// NonStop 伺服器回傳 UTC 時間，轉換成本地時間來比對
-			compareTime := remoteTime.Local()
-			
-			if compareTime.After(localInfo.ModTime()) {
-				log.Printf("🕒 遠端檔案較新: %s (本地: %s, 遠端: %s)", localName, 
-					localInfo.ModTime().Format("2006-01-02 15:04:05"),
-					compareTime.Format("2006-01-02 15:04:05"))
+			// 讀取 txt 記錄的時間
+			recordedTime, err := getRecordedFileTime(cfg, localName)
+			if err != nil {
+				log.Printf("⚠️  讀取記錄時間失敗: %v", err)
+			}
+
+			if recordedTime.IsZero() {
+				// 沒有記錄，表示是新檔案或首次使用此功能，需要下載
+				log.Printf("🕒 首次下載或無時間記錄: %s (遠端: %s)", localName,
+					remoteTime.Local().Format("2006-01-02 15:04:05"))
+				needDownload = true
+				if downloadReason != "" {
+					downloadReason += "、無時間記錄"
+				} else {
+					downloadReason = "無時間記錄，需要下載"
+				}
+			} else if remoteTime.After(recordedTime) {
+				// 遠端時間比記錄的時間新
+				log.Printf("🕒 遠端檔案較新: %s (記錄: %s, 遠端: %s)", localName,
+					recordedTime.Format("2006-01-02 15:04:05"),
+					remoteTime.Local().Format("2006-01-02 15:04:05"))
 				needDownload = true
 				if downloadReason != "" {
 					downloadReason += "、遠端檔案較新"
 				} else {
 					downloadReason = "遠端檔案較新"
 				}
+			} else {
+				log.Printf("✓ 遠端檔案未更新: %s (記錄: %s, 遠端: %s)", localName,
+					recordedTime.Format("2006-01-02 15:04:05"),
+					remoteTime.Local().Format("2006-01-02 15:04:05"))
 			}
 		}
-		
+
 		// 如果檔案相同，跳過下載
 		if !needDownload {
 			if remoteSize > 0 {
@@ -609,15 +753,15 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 			} else {
 				log.Printf("⏭️  跳過下載: %s (本地檔案已存在)", localName)
 			}
-			
+
 			// 記錄跳過的原因
 			logInfo["status"] = "跳過下載"
 			logInfo["reason"] = "本地檔案已是最新"
 			writeFileLog(cfg, localName, logInfo)
-			
+
 			return false, nil
 		}
-		
+
 		log.Printf("🔄 更新檔案: %s (遠端大小: %d bytes)", localName, remoteSize)
 	} else {
 		// 本地檔案不存在，需要下載
@@ -628,7 +772,7 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 			log.Printf("📥 下載新檔案: %s", localName)
 		}
 	}
-	
+
 	logInfo["reason"] = downloadReason
 
 	reader, err := client.Retr(remotePath)
@@ -672,19 +816,22 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	if err := os.WriteFile(localPath, processed, 0644); err != nil {
 		return false, fmt.Errorf("write %s: %w", localPath, err)
 	}
-	
+
 	// 記錄下載的位元組數
 	logInfo["downloaded_bytes"] = fmt.Sprintf("%d", rawBytesRead)
 
-	// Set file modification time to match remote file time
+	// 設定檔案時間為本地當前時間，並將遠端時間記錄到 txt
+	localNow := time.Now()
+	log.Printf("🕒 設定檔案時間為本地時間: %s", localNow.Format("2006-01-02 15:04:05"))
+
+	if err := os.Chtimes(localPath, localNow, localNow); err != nil {
+		log.Printf("⚠️  Warning: Failed to set file time for %s: %v", localPath, err)
+	}
+
+	// 記錄遠端檔案時間到 txt
 	if !remoteTime.IsZero() {
-		// NonStop 伺服器回傳的是 UTC 時間，需要轉換成本地時間
-		// 這樣下載的檔案時間就會和 FileZilla 顯示的一致
-		localTime := remoteTime.Local()
-		log.Printf("🕒 設定檔案時間為: %s", localTime.Format("2006-01-02 15:04:05"))
-		
-		if err := os.Chtimes(localPath, localTime, localTime); err != nil {
-			log.Printf("⚠️  Warning: Failed to set file time for %s: %v", localPath, err)
+		if err := saveRecordedFileTime(cfg, localName, remoteTime); err != nil {
+			log.Printf("⚠️  Warning: Failed to save recorded time for %s: %v", localName, err)
 		}
 	}
 
@@ -693,7 +840,7 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	if err != nil {
 		return false, fmt.Errorf("verify written file %s: %w", localPath, err)
 	}
-	
+
 	// 記錄最終檔案資訊
 	logInfo["final_size"] = fmt.Sprintf("%d", writtenInfo.Size())
 	logInfo["local_time_after"] = writtenInfo.ModTime().Format("2006-01-02 15:04:05")
@@ -719,7 +866,7 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	} else if remoteSize > 0 && rawBytesRead == remoteSize {
 		log.Printf("✓ Download verification passed: raw data matches remote size")
 	}
-	
+
 	// 寫入獨立的檔案 log
 	if err := writeFileLog(cfg, localName, logInfo); err != nil {
 		log.Printf("⚠️  Warning: Failed to write file log for %s: %v", localName, err)
@@ -754,7 +901,7 @@ func splitFileByPrefix(filePath string, prefixes []string) error {
 
 	// 按行分割
 	lines := strings.Split(string(data), "\n")
-	
+
 	// 用於存儲每個前綴的內容
 	splitData := make(map[string][]string)
 	lineCount := 0
@@ -966,21 +1113,22 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 	addr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
 	log.Printf("Connecting to %s ...", addr)
 
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
-		ServerName:         cfg.Host,
-	}
-
 	dialOptions := []ftp.DialOption{
 		ftp.DialWithTimeout(10 * time.Second),
 		// 不設定 DialWithLocation，讓 FTP 庫用 UTC 解析時間
 		// 然後在設定檔案時間時用 .Local() 轉換成本地時間
 	}
 
-	if cfg.UseImplicitTLS {
-		dialOptions = append(dialOptions, ftp.DialWithTLS(tlsConfig))
-	} else {
-		dialOptions = append(dialOptions, ftp.DialWithExplicitTLS(tlsConfig))
+	if cfg.UseTLS {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+			ServerName:         cfg.Host,
+		}
+		if cfg.UseImplicitTLS {
+			dialOptions = append(dialOptions, ftp.DialWithTLS(tlsConfig))
+		} else {
+			dialOptions = append(dialOptions, ftp.DialWithExplicitTLS(tlsConfig))
+		}
 	}
 
 	client, err := ftp.Dial(addr, dialOptions...)
@@ -1041,7 +1189,7 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 		log.Println("Downloading specified files from config...")
 		for _, mapping := range cfg.FileNames {
 			basePath := strings.TrimSpace(mapping.RemotePath)
-			
+
 			// 檢查路徑專屬的時間範圍
 			if mapping.AllowedTimeRange != "" {
 				within, err := isWithinTimeRange(mapping.AllowedTimeRange)
@@ -1055,11 +1203,11 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 				}
 				log.Printf("✅ 目錄 %s 在允許時間範圍 %s 內，執行下載", basePath, mapping.AllowedTimeRange)
 			}
-			
+
 			// 檢查結帳檔（針對此路徑映射）- 檢查本地是否有當天的 DATCLOSE
 			if mapping.CheckFlagFile && mapping.FlagFileName != "" {
 				log.Printf("🔍 檢查本地結帳檔: %s", mapping.FlagFileName)
-				
+
 				if !checkLocalFlagFile(cfg) {
 					log.Printf("⏭️  跳過目錄 %s：本地結帳檔 %s 不存在或不是當天的檔案", basePath, mapping.FlagFileName)
 					continue
@@ -1092,7 +1240,7 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 				}
 				if downloaded {
 					downloadCount++
-					
+
 					// 下載成功後，檢查是否需要分檔
 					if len(cfg.SplitFilePrefixes) > 0 {
 						localPath := filepath.Join(cfg.LocalDir, localFileName)
@@ -1116,7 +1264,7 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 			}
 			if downloaded {
 				downloadCount++
-				
+
 				// 下載成功後，檢查是否需要分檔
 				if len(cfg.SplitFilePrefixes) > 0 {
 					localPath := filepath.Join(cfg.LocalDir, name)
@@ -1129,15 +1277,78 @@ func runDownload(cfg *Config, logWriter io.Writer) error {
 	}
 
 	log.Printf("Download completed. %d file(s) downloaded.", downloadCount)
-	
+
 	// 下載完成後，刪除結帳檔（如果啟用自動刪除）
 	deleteFlagFile(cfg)
-	
+
 	return nil
 }
 
 func main() {
-	configPath := flag.String("config", "config.properties", "Path to configuration file")
+	// Setup logging with timestamp
+	log.SetFlags(log.LstdFlags)
+
+	// ---------------------------------------------------------------
+	// 盡早建立啟動 log。
+	// 策略（依序嘗試，全部成功時同時寫入）：
+	//   1. <exe目錄>\logs\ftps-downloader-<日期>.log   (正式日誌)
+	//   2. <exe目錄>\ftps-downloader-startup.log        (緊急備援，直接放在 exe 旁)
+	//   3. stdout                                        (最後手段)
+	// ---------------------------------------------------------------
+	var logWriters []io.Writer
+	logWriters = append(logWriters, os.Stdout)
+
+	today := time.Now().Format("2006-01-02")
+	var startupLogFile *os.File
+
+	exePath, exeErr := os.Executable()
+	if exeErr == nil {
+		exeDir := filepath.Dir(exePath)
+
+		// 1. 正式日誌：<exe目錄>\logs\ftps-downloader-<日期>.log
+		logsDir := filepath.Join(exeDir, "logs")
+		_ = os.MkdirAll(logsDir, 0755)
+		mainLogPath := filepath.Join(logsDir, "ftps-downloader-"+today+".log")
+		if f, err := os.OpenFile(mainLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			if info, _ := f.Stat(); info != nil && info.Size() <= 3 {
+				_, _ = f.Write([]byte{0xEF, 0xBB, 0xBF})
+			}
+			startupLogFile = f
+			logWriters = append(logWriters, f)
+		}
+
+		// 2. 緊急備援：<exe目錄>\ftps-downloader-startup.log（不分日期，方便檢查）
+		emergencyPath := filepath.Join(exeDir, "ftps-downloader-startup.log")
+		if ef, err := os.OpenFile(emergencyPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			defer ef.Close()
+			fmt.Fprintf(ef, "\n--- %s ---\n", time.Now().Format("2006-01-02 15:04:05"))
+			fmt.Fprintf(ef, "exe: %s\n", exePath)
+			fmt.Fprintf(ef, "main log: %s\n", mainLogPath)
+			logWriters = append(logWriters, ef)
+		}
+	}
+
+	log.SetOutput(io.MultiWriter(logWriters...))
+
+	if exeErr != nil {
+		log.Printf("⚠️  無法取得 exe 路徑: %v，日誌僅輸出至 stdout", exeErr)
+	}
+
+	log.Printf("========================================")
+	log.Printf("FTPS Downloader started")
+	log.Printf("========================================")
+	log.Println()
+
+	// 1. 確保單一執行實例（終止舊實例）
+	if err := ensureSingleInstance(); err != nil {
+		log.Printf("❌ 執行實例檢查失敗: %v", err)
+		if startupLogFile != nil {
+			startupLogFile.Close()
+		}
+		os.Exit(1)
+	}
+
+	configPath := flag.String("config", "", "Path to configuration file (default: config.properties next to the exe)")
 	hostFlag := flag.String("host", "", "FTP server host (direct mode or override)")
 	portFlag := flag.String("port", "21", "FTP server port")
 	userFlag := flag.String("user", "", "FTP username (direct mode or override)")
@@ -1147,6 +1358,7 @@ func main() {
 	localDirFlag := flag.String("local-dir", "", "Local download directory override")
 	logDirFlag := flag.String("log-dir", "", "Log directory override")
 	implicitFlag := flag.Bool("implicit-tls", false, "Use implicit TLS")
+	noTLSFlag := flag.Bool("no-tls", false, "Disable TLS, use plain FTP")
 	insecureFlag := flag.Bool("insecure-skip-verify", false, "Skip TLS certificate verification")
 	sourceEncFlag := flag.String("source-encoding", "", "Source encoding name")
 	targetEncFlag := flag.String("target-encoding", "", "Target encoding name")
@@ -1163,6 +1375,23 @@ func main() {
 	flag.Var(&filesFlag, "file", "Remote file specification remote[:local]; repeat for multiple files (direct mode)")
 
 	flag.Parse()
+
+	// 若使用者沒有明確指定 -config，自動決定設定檔路徑：
+	// 優先用 exe 所在目錄的 config.properties，確保無論從哪個工作目錄執行都能找到。
+	if *configPath == "" {
+		resolvedConfig := "config.properties"
+		// 嘗試從 exe 所在目錄尋找
+		if exePath, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exePath)
+			candidate := filepath.Join(exeDir, "config.properties")
+			// 優先用 exe 目錄旁的設定檔；若不存在才嘗試當前工作目錄
+			if _, err := os.Stat(candidate); err == nil {
+				resolvedConfig = candidate
+			}
+		}
+		*configPath = resolvedConfig
+		log.Printf("設定檔: %s", *configPath)
+	}
 
 	overrides := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) {
@@ -1200,6 +1429,7 @@ func main() {
 			LocalDir:           strings.TrimSpace(*localDirFlag),
 			LogDir:             strings.TrimSpace(*logDirFlag),
 			FileNames:          []PathMapping{mapping},
+			UseTLS:             !*noTLSFlag,
 			UseImplicitTLS:     *implicitFlag,
 			InsecureSkipVerify: *insecureFlag,
 			SourceEncoding:     strings.TrimSpace(*sourceEncFlag),
@@ -1260,6 +1490,9 @@ func main() {
 	if overrides["implicit-tls"] {
 		cfg.UseImplicitTLS = *implicitFlag
 	}
+	if overrides["no-tls"] {
+		cfg.UseTLS = !*noTLSFlag
+	}
 	if overrides["insecure-skip-verify"] {
 		cfg.InsecureSkipVerify = *insecureFlag
 	}
@@ -1300,6 +1533,132 @@ func main() {
 	}
 }
 
+// formatFileSize 格式化檔案大小顯示
+func formatFileSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+// ensureSingleInstance 確保只有一個程式實例在執行
+// 使用 Windows Mutex 機制，如果檢測到已有實例在執行，會終止舊實例
+func ensureSingleInstance() error {
+	mutexName, err := syscall.UTF16PtrFromString("Local\\FTPSDownloader_Mutex_Singleton")
+	if err != nil {
+		return fmt.Errorf("建立 Mutex 名稱失敗: %w", err)
+	}
+
+	// 嘗試建立 Mutex
+	ret, _, err := procCreateMutex.Call(
+		0,
+		0,
+		uintptr(unsafe.Pointer(mutexName)),
+	)
+
+	if ret == 0 {
+		return fmt.Errorf("建立 Mutex 失敗: %w", err)
+	}
+
+	// 取得 GetLastError 的值
+	lastErr, _, _ := procGetLastError.Call()
+
+	const ERROR_ALREADY_EXISTS = 183
+
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("【執行實例檢查】")
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	if lastErr == ERROR_ALREADY_EXISTS {
+		log.Printf("⚠️  偵測到已有執行中的下載程式實例")
+		log.Printf("正在終止舊的執行實例...")
+
+		// 查找並終止已存在的 ftps-downloader.exe 程式
+		if err := killExistingDownloaderProcess(); err != nil {
+			log.Printf("❌ 無法終止舊實例: %v", err)
+			log.Printf("請手動關閉其他執行中的下載程式後重試")
+			return fmt.Errorf("已有程式實例在執行中，且無法自動終止")
+		}
+
+		log.Printf("✓ 舊實例已終止，繼續執行新程式")
+		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		log.Println()
+
+		// 等待一下確保舊程式完全結束
+		time.Sleep(2 * time.Second)
+	} else {
+		log.Printf("✓ 沒有其他執行中的實例，程式正常啟動")
+		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		log.Println()
+	}
+
+	return nil
+}
+
+// killExistingDownloaderProcess 查找並終止已存在的 ftps-downloader.exe 程式（排除自己）
+func killExistingDownloaderProcess() error {
+	// 取得當前程式的 PID
+	currentPID := os.Getpid()
+
+	// 使用 tasklist 查找所有名為 ftps-downloader.exe 的程式
+	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq ftps-downloader.exe", "/FO", "CSV", "/NH")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("執行 tasklist 失敗: %w", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	killedCount := 0
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// CSV 格式: "程式名稱","PID","工作階段名稱","工作階段#","記憶體使用量"
+		fields := strings.Split(line, ",")
+		if len(fields) < 2 {
+			continue
+		}
+
+		// 移除引號並取得 PID
+		pidStr := strings.Trim(fields[1], "\" ")
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			continue
+		}
+
+		// 不要終止自己
+		if pid == currentPID {
+			continue
+		}
+
+		// 終止該程式
+		log.Printf("🔫 終止程式 PID: %d", pid)
+		killCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
+		if err := killCmd.Run(); err != nil {
+			log.Printf("⚠️  無法終止 PID %d: %v", pid, err)
+		} else {
+			killedCount++
+			log.Printf("✓ 已終止 PID: %d", pid)
+		}
+	}
+
+	if killedCount == 0 {
+		// 雖然 Mutex 顯示有實例，但可能剛好結束了
+		log.Printf("ℹ️  未找到需要終止的程式實例")
+		return nil
+	}
+
+	return nil
+}
+
 // cleanOldLogs 清理超過指定天數的舊日誌檔案
 func cleanOldLogs(logDir string, keepDays int) error {
 	if logDir == "" {
@@ -1311,21 +1670,30 @@ func cleanOldLogs(logDir string, keepDays int) error {
 		return nil
 	}
 
-	cutoffTime := time.Now().AddDate(0, 0, -keepDays)
-	
+	now := time.Now()
+	cutoffTime := now.AddDate(0, 0, -keepDays)
+
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("【日誌清理】檢查日誌目錄: %s", logDir)
+	log.Printf("保留天數: %d 天 (刪除 %s 之前的日誌)", keepDays, cutoffTime.Format("2006-01-02"))
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
+		log.Printf("⚠️  無法讀取日誌目錄: %v", err)
 		return fmt.Errorf("read log directory: %w", err)
 	}
 
 	deletedCount := 0
+	var deletedSize int64
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 
 		// 只處理 .log 檔案
-		if !strings.HasSuffix(entry.Name(), ".log") {
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".log") {
 			continue
 		}
 
@@ -1338,18 +1706,27 @@ func cleanOldLogs(logDir string, keepDays int) error {
 
 		// 檢查檔案修改時間
 		if info.ModTime().Before(cutoffTime) {
+			fileSize := info.Size()
 			if err := os.Remove(filePath); err != nil {
-				log.Printf("⚠️  無法刪除舊日誌: %s (%v)", entry.Name(), err)
+				log.Printf("⚠️  無法刪除: %s (%v)", entry.Name(), err)
 			} else {
 				deletedCount++
-				log.Printf("🗑️  已刪除舊日誌: %s (修改時間: %s)", entry.Name(), info.ModTime().Format("2006-01-02"))
+				deletedSize += fileSize
+				log.Printf("🗑️  已刪除: %s (修改時間: %s, 大小: %s)",
+					entry.Name(),
+					info.ModTime().Format("2006-01-02 15:04:05"),
+					formatFileSize(fileSize))
 			}
 		}
 	}
 
 	if deletedCount > 0 {
-		log.Printf("✓ 清理完成：已刪除 %d 個超過 %d 天的舊日誌檔案", deletedCount, keepDays)
+		log.Printf("✓ 清理完成: 刪除 %d 個舊日誌檔案，釋放空間 %s", deletedCount, formatFileSize(deletedSize))
+	} else {
+		log.Printf("✓ 無需清理: 沒有超過 %d 天的日誌檔案", keepDays)
 	}
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Println()
 
 	return nil
 }
@@ -1369,7 +1746,7 @@ func checkLocalFlagFile(cfg *Config) bool {
 	// 檢查是否為今天的檔案
 	today := time.Now().Format("2006-01-02")
 	fileDate := info.ModTime().Format("2006-01-02")
-	
+
 	return today == fileDate
 }
 
@@ -1386,7 +1763,7 @@ func downloadFlagFile(client *ftp.ServerConn, cfg *Config) error {
 	// 構建遠端完整路徑
 	var flagPath string
 	basePath := strings.TrimSpace(cfg.FlagFilePath)
-	
+
 	if basePath != "" {
 		// Guardian 路徑格式處理
 		if strings.Contains(basePath, "\\") {
@@ -1447,23 +1824,23 @@ func run(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("configuration is nil")
 	}
-	
+
 	// ========================================
 	// 參數驗證
 	// ========================================
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Println("【參數驗證】檢查設定檔參數...")
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	
+
 	cfg.Host = strings.TrimSpace(cfg.Host)
 	cfg.Port = strings.TrimSpace(cfg.Port)
-	
+
 	// 驗證必要參數
 	if cfg.Host == "" {
 		return fmt.Errorf("❌ 驗證失敗: host 參數未設定")
 	}
 	log.Printf("✓ FTP 主機: %s", cfg.Host)
-	
+
 	if cfg.Port == "" {
 		cfg.Port = "21"
 		log.Printf("ℹ️  FTP 埠號: %s (使用預設值)", cfg.Port)
@@ -1474,17 +1851,17 @@ func run(cfg *Config) error {
 		}
 		log.Printf("✓ FTP 埠號: %s", cfg.Port)
 	}
-	
+
 	if cfg.User == "" {
 		return fmt.Errorf("❌ 驗證失敗: user 參數未設定")
 	}
 	log.Printf("✓ FTP 帳號: %s", cfg.User)
-	
+
 	if cfg.Pass == "" {
 		return fmt.Errorf("❌ 驗證失敗: pass 參數未設定")
 	}
 	log.Printf("✓ FTP 密碼: %s", strings.Repeat("*", len(cfg.Pass)))
-	
+
 	// 驗證目錄設定
 	if cfg.LocalDir == "" {
 		cfg.LocalDir = "./downloads"
@@ -1492,18 +1869,18 @@ func run(cfg *Config) error {
 	} else {
 		log.Printf("✓ 本地目錄: %s", cfg.LocalDir)
 	}
-	
+
 	if cfg.RemoteDir != "" {
 		log.Printf("✓ 遠端目錄: %s", cfg.RemoteDir)
 	}
-	
+
 	// 驗證監控模式參數
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = 30
 	}
 	if cfg.MonitorMode {
 		log.Printf("✓ 監控模式: 已啟用 (間隔: %d 分鐘)", cfg.CheckInterval)
-		
+
 		// 驗證時間範圍格式
 		if cfg.AllowedTimeRange != "" {
 			if _, err := isWithinTimeRange(cfg.AllowedTimeRange); err != nil {
@@ -1511,7 +1888,7 @@ func run(cfg *Config) error {
 			}
 			log.Printf("✓ 時間範圍: %s", cfg.AllowedTimeRange)
 		}
-		
+
 		// 驗證停止時間格式
 		if cfg.StopTime != "" {
 			if _, err := shouldStopMonitor(cfg.StopTime); err != nil {
@@ -1520,25 +1897,27 @@ func run(cfg *Config) error {
 			log.Printf("✓ 停止時間: %s", cfg.StopTime)
 		}
 	}
-	
+
 	// 驗證 TLS 設定
-	if cfg.UseImplicitTLS {
-		log.Printf("✓ TLS 模式: Implicit TLS (通常使用 port 990)")
+	if !cfg.UseTLS {
+		log.Printf("✓ 連線模式: 純文字 FTP（無加密）")
+	} else if cfg.UseImplicitTLS {
+		log.Printf("✓ 連線模式: FTPS Implicit TLS (通常使用 port 990)")
 	} else {
-		log.Printf("✓ TLS 模式: Explicit TLS")
+		log.Printf("✓ 連線模式: FTPS Explicit TLS")
 	}
-	
-	if cfg.InsecureSkipVerify {
+
+	if cfg.UseTLS && cfg.InsecureSkipVerify {
 		log.Printf("⚠️  SSL 驗證: 已停用 (insecure_skip_verify=true)")
 	}
-	
+
 	// 驗證檔案設定
 	if len(cfg.FileNames) == 0 {
 		log.Printf("ℹ️  下載模式: 下載遠端目錄所有檔案")
 	} else {
 		log.Printf("✓ 下載模式: 指定檔案清單 (%d 個路徑)", len(cfg.FileNames))
 	}
-	
+
 	// 驗證編碼設定
 	if cfg.SourceEncoding != "" || cfg.TargetEncoding != "" {
 		if cfg.SourceEncoding != "" && cfg.TargetEncoding != "" {
@@ -1547,16 +1926,16 @@ func run(cfg *Config) error {
 			return fmt.Errorf("❌ 驗證失敗: source_encoding 和 target_encoding 必須同時設定")
 		}
 	}
-	
+
 	if cfg.RawDownload {
 		log.Printf("✓ 下載模式: 原始模式 (不處理任何資料)")
 	}
-	
+
 	// 驗證分檔設定
 	if len(cfg.SplitFilePrefixes) > 0 {
 		log.Printf("✓ 分檔功能: 已啟用 (前綴: %s)", strings.Join(cfg.SplitFilePrefixes, ", "))
 	}
-	
+
 	log.Println("✓ 參數驗證通過")
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Println()
@@ -1579,21 +1958,21 @@ func run(cfg *Config) error {
 		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 			log.Printf("Error creating log directory: %v", err)
 		} else {
-			// 清理超過指定天數的舊日誌（預設 3 天）
-			keepDays := cfg.LogRetentionDays
-			if keepDays <= 0 {
-				keepDays = 3
-			}
-			if err := cleanOldLogs(cfg.LogDir, keepDays); err != nil {
-				log.Printf("⚠️  清理舊日誌時發生錯誤: %v", err)
-			}
-			
 			logFileName := fmt.Sprintf("ftps-downloader-%s.log", time.Now().Format("2006-01-02"))
 			logPath = filepath.Join(cfg.LogDir, logFileName)
+
+			// 檢查文件是否是新建的
+			fileInfo, _ := os.Stat(logPath)
+			isNewFile := fileInfo == nil || fileInfo.Size() == 0
+
 			file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 			if err != nil {
 				log.Printf("Error opening log file: %v", err)
 			} else {
+				// 為新文件寫入 UTF-8 BOM，讓 Windows 記事本能正確識別 UTF-8
+				if isNewFile {
+					file.Write([]byte{0xEF, 0xBB, 0xBF})
+				}
 				logFile = file
 				logWriter = logFile
 			}
@@ -1608,6 +1987,17 @@ func run(cfg *Config) error {
 	if logFile != nil {
 		defer logFile.Close()
 		log.Printf("Logging to %s", logPath)
+	}
+
+	// 設置完日誌輸出後，清理超過指定天數的舊日誌（預設 3 天）
+	if cfg.LogDir != "" {
+		keepDays := cfg.LogRetentionDays
+		if keepDays <= 0 {
+			keepDays = 3
+		}
+		if err := cleanOldLogs(cfg.LogDir, keepDays); err != nil {
+			log.Printf("⚠️  清理舊日誌時發生錯誤: %v", err)
+		}
 	}
 
 	// 如果啟用監控模式，進入循環
@@ -1643,13 +2033,13 @@ func run(cfg *Config) error {
 				oldStopTime := cfg.StopTime
 				oldTimeRange := cfg.AllowedTimeRange
 				oldInterval := cfg.CheckInterval
-				
+
 				cfg.StopTime = tempCfg.StopTime
 				cfg.AllowedTimeRange = tempCfg.AllowedTimeRange
 				if tempCfg.CheckInterval > 0 {
 					cfg.CheckInterval = tempCfg.CheckInterval
 				}
-				
+
 				// 記錄參數變更
 				if oldStopTime != cfg.StopTime {
 					log.Printf("🔄 偵測到參數變更: stop_time [%s] → [%s]", oldStopTime, cfg.StopTime)
@@ -1728,9 +2118,9 @@ func run(cfg *Config) error {
 			nextCheck := currentTime.Add(time.Duration(cfg.CheckInterval) * time.Minute)
 			log.Printf("⏭️  下次檢查時間: %s", nextCheck.Format("2006-01-02 15:04:05"))
 			log.Printf("💤 進入休眠 %d 分鐘...\n", cfg.CheckInterval)
-			
+
 			time.Sleep(time.Duration(cfg.CheckInterval) * time.Minute)
-			
+
 			// 休眠後立即檢查停止時間（避免在休眠期間錯過停止時間）
 			if cfg.StopTime != "" {
 				should, err := shouldStopMonitor(cfg.StopTime)
