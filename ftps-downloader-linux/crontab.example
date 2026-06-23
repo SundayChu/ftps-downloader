@@ -1,0 +1,12 @@
+# FTPS Downloader - Linux 排程範例 (crontab)
+# 每天早上 7:00 執行，並在 18:00 前自動停止（透過 config 中 stop_time 控制）
+# 編輯 crontab: crontab -e
+
+# 每天 07:00 啟動下載程式
+# 0 7 * * * /home/user/ftps-downloader/run.sh >> /home/user/ftps-downloader/logs/cron.log 2>&1
+
+# 查看執行中的程式
+# ps aux | grep ftps-downloader
+
+# 手動停止
+# pkill -f ftps-downloader

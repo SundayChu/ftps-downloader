@@ -10,13 +10,10 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/jlaffaye/ftp"
 	"golang.org/x/text/encoding"
@@ -24,12 +21,6 @@ import (
 	"golang.org/x/text/encoding/traditionalchinese"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
-)
-
-var (
-	kernel32         = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutex  = kernel32.NewProc("CreateMutexW")
-	procGetLastError = kernel32.NewProc("GetLastError")
 )
 
 type PathMapping struct {
@@ -1545,118 +1536,6 @@ func formatFileSize(size int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
-}
-
-// ensureSingleInstance 確保只有一個程式實例在執行
-// 使用 Windows Mutex 機制，如果檢測到已有實例在執行，會終止舊實例
-func ensureSingleInstance() error {
-	mutexName, err := syscall.UTF16PtrFromString("Local\\FTPSDownloader_Mutex_Singleton")
-	if err != nil {
-		return fmt.Errorf("建立 Mutex 名稱失敗: %w", err)
-	}
-
-	// 嘗試建立 Mutex
-	ret, _, err := procCreateMutex.Call(
-		0,
-		0,
-		uintptr(unsafe.Pointer(mutexName)),
-	)
-
-	if ret == 0 {
-		return fmt.Errorf("建立 Mutex 失敗: %w", err)
-	}
-
-	// 取得 GetLastError 的值
-	lastErr, _, _ := procGetLastError.Call()
-
-	const ERROR_ALREADY_EXISTS = 183
-
-	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	log.Printf("【執行實例檢查】")
-	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-	if lastErr == ERROR_ALREADY_EXISTS {
-		log.Printf("⚠️  偵測到已有執行中的下載程式實例")
-		log.Printf("正在終止舊的執行實例...")
-
-		// 查找並終止已存在的 ftps-downloader.exe 程式
-		if err := killExistingDownloaderProcess(); err != nil {
-			log.Printf("❌ 無法終止舊實例: %v", err)
-			log.Printf("請手動關閉其他執行中的下載程式後重試")
-			return fmt.Errorf("已有程式實例在執行中，且無法自動終止")
-		}
-
-		log.Printf("✓ 舊實例已終止，繼續執行新程式")
-		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		log.Println()
-
-		// 等待一下確保舊程式完全結束
-		time.Sleep(2 * time.Second)
-	} else {
-		log.Printf("✓ 沒有其他執行中的實例，程式正常啟動")
-		log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		log.Println()
-	}
-
-	return nil
-}
-
-// killExistingDownloaderProcess 查找並終止已存在的 ftps-downloader.exe 程式（排除自己）
-func killExistingDownloaderProcess() error {
-	// 取得當前程式的 PID
-	currentPID := os.Getpid()
-
-	// 使用 tasklist 查找所有名為 ftps-downloader.exe 的程式
-	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq ftps-downloader.exe", "/FO", "CSV", "/NH")
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("執行 tasklist 失敗: %w", err)
-	}
-
-	lines := strings.Split(string(output), "\n")
-	killedCount := 0
-
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		// CSV 格式: "程式名稱","PID","工作階段名稱","工作階段#","記憶體使用量"
-		fields := strings.Split(line, ",")
-		if len(fields) < 2 {
-			continue
-		}
-
-		// 移除引號並取得 PID
-		pidStr := strings.Trim(fields[1], "\" ")
-		pid, err := strconv.Atoi(pidStr)
-		if err != nil {
-			continue
-		}
-
-		// 不要終止自己
-		if pid == currentPID {
-			continue
-		}
-
-		// 終止該程式
-		log.Printf("🔫 終止程式 PID: %d", pid)
-		killCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
-		if err := killCmd.Run(); err != nil {
-			log.Printf("⚠️  無法終止 PID %d: %v", pid, err)
-		} else {
-			killedCount++
-			log.Printf("✓ 已終止 PID: %d", pid)
-		}
-	}
-
-	if killedCount == 0 {
-		// 雖然 Mutex 顯示有實例，但可能剛好結束了
-		log.Printf("ℹ️  未找到需要終止的程式實例")
-		return nil
-	}
-
-	return nil
 }
 
 // cleanOldLogs 清理超過指定天數的舊日誌檔案
