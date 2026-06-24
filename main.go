@@ -316,11 +316,17 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 	localPath := filepath.Join(cfg.LocalDir, localName)
 	if remoteSize, err := client.FileSize(remotePath); err == nil {
 		if remoteSize == 0 {
-			log.Printf("  ⊘ Remote file size is 0 bytes, skipping download")
+			logBoth("  ⊘  遠端檔案大小為 0 bytes，跳過下載以保護本地資料")
+			if fileLogger != nil {
+				fileLogger.Printf("════════════════════════════════════════════════")
+				fileLogger.Printf("結束時間: %s", time.Now().Format("2006-01-02 15:04:05"))
+				fileLogger.Printf("狀態: 跳過下載（遠端大小為 0）")
+				fileLogger.Printf("════════════════════════════════════════════════")
+			}
 			return false, nil
 		}
 	} else {
-		log.Printf("  Warning: unable to pre-check remote file size for %s: %v", remotePath, err)
+		logBoth("  ⚠️  無法預先確認遠端檔案大小 %s: %v", remotePath, err)
 	}
 
 	remoteSize := int64(-1)
@@ -996,7 +1002,13 @@ func shouldDownloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localNa
 		}
 	}
 
-	// 情況6: 根據 compare_by_modtime 設定選擇比對方式
+	// 情況6: 遠端檔案大小為 0 → 跳過下載，避免覆蓋本地有效資料
+	if sizeAvailable && remoteSize == 0 {
+		log.Printf("  ⊘  遠端檔案大小為 0，跳過下載以保護本地資料")
+		return false, "遠端檔案大小為 0，跳過下載", nil
+	}
+
+	// 情況7: 根據 compare_by_modtime 設定選擇比對方式
 	if cfg.CompareByModTime {
 		// 使用修改時間比對
 		if !timeAvailable {

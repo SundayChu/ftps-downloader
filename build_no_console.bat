@@ -10,7 +10,7 @@ set LINUX_DIR=ftps-downloader-linux
 echo [1/2] 編譯 Windows 版 %EXE_NAME% (隱藏模式)...
 
 :TRY_BUILD_WIN
-go build -ldflags="-H=windowsgui" -o %EXE_NAME% ./cmd/downloader
+go build -mod=mod -ldflags="-H=windowsgui" -o %EXE_NAME% ./cmd/downloader
 
 if %ERRORLEVEL% EQU 0 (
     echo   OK: %EXE_NAME% 建立成功（無主控台）
@@ -39,7 +39,7 @@ if not exist %LINUX_DIR% mkdir %LINUX_DIR%
 
 set GOOS=linux
 set GOARCH=amd64
-go build -o %LINUX_EXE% ./cmd/downloader
+go build -mod=mod -o %LINUX_EXE% ./cmd/downloader
 set GOOS=
 set GOARCH=
 

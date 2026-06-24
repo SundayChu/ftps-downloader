@@ -1,0 +1,103 @@
+# FTPS Downloader 設定檔
+
+# FTPS 伺服器設定
+host=128.110.3.38
+port=22
+user=twse_tp
+pass=d5x7g2kv
+
+# 目錄設定
+remote_dir=
+local_dir=./downloads
+log_dir=./logs
+file_times_dir=./file_times
+
+# ===== 日誌設定 =====
+# 是否顯示 LIST 命令輸出（檔案清單詳情）
+# false: 隱藏 LIST 輸出（預設，避免日誌過於冗長和洩露敏感資訊）
+# true: 顯示完整的 FTP LIST 響應（用於調試）
+debug_list=false
+
+# 是否停用 MLSD，強制使用 LIST（NonStop 伺服器建議 true）
+disable_mlsd=true
+
+# 是否為每個下載的檔案建立獨立的日誌
+# true: 在 logs/ 目錄下為每個檔案建立 download_<filename>_<timestamp>.log
+# false: 所有下載記錄寫入主日誌檔案
+separate_file_log=true
+
+#協議	設定方式	加密
+#FTP	use_sftp=false + use_tls=false	無
+#FTPS Explicit	use_sftp=false + use_tls=true + use_implicit_tls=false	TLS
+#FTPS Implicit	use_sftp=false + use_tls=true + use_implicit_tls=true	TLS
+#SFTP	use_sftp=true	SSH
+
+
+# TLS / 連線模式設定
+# true  = 使用 FTPS（加密）
+# false = 使用純文字 FTP（無加密）
+use_sftp=true
+#use_tls=true
+#use_implicit_tls=false
+insecure_skip_verify=true
+
+#skip_header_bytes=-1
+
+# ===== 監控模式設定 =====
+# 啟用全天監控模式（程式會持續運行，定期自動下載）
+monitor_mode=true
+
+# 檢查間隔（分鐘）- 每隔多久檢查一次
+check_interval=30
+
+# 允許下載的時間範圍（格式：HH:mm-HH:mm）
+# 例如：02:00-05:00 表示只在凌晨 2 點到 5 點之間下載
+# 如果不設定或留空，則全天都可以下載
+#allowed_time_range=02:00-05:00
+
+# 自動停止時間（格式：HH:mm）
+# 例如：18:00 表示到了下午 6 點就自動停止程式
+# 如果不設定或留空，則程式會持續運行直到手動停止
+stop_time=18:17
+
+check_flag_file=True
+flag_file_name=DATCLOSE
+ 
+
+# Guardian/NonStop 系統通常使用 EBCDIC 編碼
+#source_encoding=ebcdic
+#target_encoding=big5
+#source_encoding=cp037
+#target_encoding=big5
+#debug_encoding=true
+guardian_add_crlf=true
+raw_download=true
+
+# 分檔設定：指定哪些檔案前綴需要進行自動分檔（以每筆資料前四碼分類）
+# 多個前綴請用逗號隔開，例如：TCD,TSC,RYM
+split_file_prefixes=TCD,TSC
+
+# ===== 檔案比對設定 =====
+# 是否啟用智慧下載（檢查本地檔案，只下載不存在或較新的檔案）
+skip_if_exists=false
+
+# 使用修改時間進行比對（如果為 false 則使用檔案大小比對）
+compare_by_modtime=true
+
+# 強制下載所有檔案（忽略本地檔案狀態）
+# 注意：此選項會覆蓋 skip_if_exists 設定
+#force_download=false
+
+# 要下載的檔案清單
+# 格式: file_names.路徑索引.remote_path=路徑
+#       file_names.路徑索引.files.檔案索引=檔名
+
+#file_names.0.remote_path=\CSTP96.$DATA.SKWORK
+#file_names.0.files.0=DATCLOSE
+#
+#
+#
+# 路徑 2: \CSTP96.$DATA.SKTMP000
+file_names.1.remote_path=\CSTP96.$DATA.SKINTER1
+file_names.1.files.0=BONDW
+# 
