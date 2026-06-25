@@ -1675,65 +1675,8 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 
 	// ---------------------------------------------------------------
-	// 盡早建立啟動 log。
-	// 策略（依序嘗試，全部成功時同時寫入）：
-	//   1. <exe目錄>\logs\ftps-downloader-<日期>.log   (正式日誌)
-	//   2. <exe目錄>\ftps-downloader-startup.log        (緊急備援，直接放在 exe 旁)
-	//   3. stdout                                        (最後手段)
+	// Step 1: 先解析 flags，才能決定正確的 log 目錄
 	// ---------------------------------------------------------------
-	var logWriters []io.Writer
-	logWriters = append(logWriters, os.Stdout)
-
-	today := time.Now().Format("2006-01-02")
-	var startupLogFile *os.File
-
-	exePath, exeErr := os.Executable()
-	if exeErr == nil {
-		exeDir := filepath.Dir(exePath)
-
-		// 1. 正式日誌：<exe目錄>\logs\ftps-downloader-<日期>.log
-		logsDir := filepath.Join(exeDir, "logs")
-		_ = os.MkdirAll(logsDir, 0755)
-		mainLogPath := filepath.Join(logsDir, "ftps-downloader-"+today+".log")
-		if f, err := os.OpenFile(mainLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-			if info, _ := f.Stat(); info != nil && info.Size() <= 3 {
-				_, _ = f.Write([]byte{0xEF, 0xBB, 0xBF})
-			}
-			startupLogFile = f
-			logWriters = append(logWriters, f)
-		}
-
-		// 2. 緊急備援：<exe目錄>\ftps-downloader-startup.log（不分日期，方便檢查）
-		emergencyPath := filepath.Join(exeDir, "ftps-downloader-startup.log")
-		if ef, err := os.OpenFile(emergencyPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-			defer ef.Close()
-			fmt.Fprintf(ef, "\n--- %s ---\n", time.Now().Format("2006-01-02 15:04:05"))
-			fmt.Fprintf(ef, "exe: %s\n", exePath)
-			fmt.Fprintf(ef, "main log: %s\n", mainLogPath)
-			logWriters = append(logWriters, ef)
-		}
-	}
-
-	log.SetOutput(io.MultiWriter(logWriters...))
-
-	if exeErr != nil {
-		log.Printf("⚠️  無法取得 exe 路徑: %v，日誌僅輸出至 stdout", exeErr)
-	}
-
-	log.Printf("========================================")
-	log.Printf("FTPS Downloader started")
-	log.Printf("========================================")
-	log.Println()
-
-	// 1. 確保單一執行實例（終止舊實例）
-	if err := ensureSingleInstance(); err != nil {
-		log.Printf("❌ 執行實例檢查失敗: %v", err)
-		if startupLogFile != nil {
-			startupLogFile.Close()
-		}
-		os.Exit(1)
-	}
-
 	configPath := flag.String("config", "", "Path to configuration file (default: config.properties next to the exe)")
 	hostFlag := flag.String("host", "", "FTP server host (direct mode or override)")
 	portFlag := flag.String("port", "21", "FTP server port")
@@ -1762,21 +1705,98 @@ func main() {
 
 	flag.Parse()
 
-	// 若使用者沒有明確指定 -config，自動決定設定檔路徑：
-	// 優先用 exe 所在目錄的 config.properties，確保無論從哪個工作目錄執行都能找到。
+	// ---------------------------------------------------------------
+	// Step 2: 決定設定檔路徑（優先用 exe 所在目錄的 config.properties）
+	// ---------------------------------------------------------------
+	exePath, exeErr := os.Executable()
 	if *configPath == "" {
 		resolvedConfig := "config.properties"
-		// 嘗試從 exe 所在目錄尋找
-		if exePath, err := os.Executable(); err == nil {
-			exeDir := filepath.Dir(exePath)
-			candidate := filepath.Join(exeDir, "config.properties")
-			// 優先用 exe 目錄旁的設定檔；若不存在才嘗試當前工作目錄
+		if exeErr == nil {
+			candidate := filepath.Join(filepath.Dir(exePath), "config.properties")
 			if _, err := os.Stat(candidate); err == nil {
 				resolvedConfig = candidate
 			}
 		}
 		*configPath = resolvedConfig
-		log.Printf("設定檔: %s", *configPath)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 3: 決定早期 log 目錄
+	//   優先順序：-log-dir flag > config 裡的 log_dir > <exe>\logs\
+	// ---------------------------------------------------------------
+	earlyLogDir := strings.TrimSpace(*logDirFlag)
+	if earlyLogDir == "" {
+		earlyLogDir = quickScanLogDir(*configPath)
+		if earlyLogDir != "" && !filepath.IsAbs(earlyLogDir) {
+			earlyLogDir = filepath.Clean(filepath.Join(filepath.Dir(*configPath), earlyLogDir))
+		}
+	}
+	if earlyLogDir == "" && exeErr == nil {
+		earlyLogDir = filepath.Join(filepath.Dir(exePath), "logs")
+	}
+
+	// ---------------------------------------------------------------
+	// Step 4: 建立 log 檔（所有 log 都寫到正確的 log 目錄）
+	// ---------------------------------------------------------------
+	today := time.Now().Format("2006-01-02")
+	var logWriters []io.Writer
+	logWriters = append(logWriters, os.Stdout)
+
+	if earlyLogDir != "" {
+		_ = os.MkdirAll(earlyLogDir, 0755)
+		mainLogPath := filepath.Join(earlyLogDir, "ftps-downloader-"+today+".log")
+		if f, err := os.OpenFile(mainLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			if info, _ := f.Stat(); info != nil && info.Size() <= 3 {
+				_, _ = f.Write([]byte{0xEF, 0xBB, 0xBF})
+			}
+			defer f.Close()
+			logWriters = append(logWriters, f)
+		}
+
+		// ftps_out-YYYY-MM-DD.log：stdout 輸出（對應 Task Scheduler 的 ftps_out.log）
+		outLogPath := filepath.Join(earlyLogDir, "ftps_out-"+today+".log")
+		if outF, err := os.OpenFile(outLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			defer outF.Close()
+			logWriters = append(logWriters, outF)
+		}
+
+		// ftps_err-YYYY-MM-DD.log：stderr 重導向（對應 Task Scheduler 的 ftps_err.log）
+		errLogPath := filepath.Join(earlyLogDir, "ftps_err-"+today+".log")
+		if errF, err := os.OpenFile(errLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			defer errF.Close()
+			os.Stderr = errF
+		}
+
+		emergencyPath := filepath.Join(earlyLogDir, "ftps-downloader-startup-"+today+".log")
+		if ef, err := os.OpenFile(emergencyPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			defer ef.Close()
+			fmt.Fprintf(ef, "\n--- %s ---\n", time.Now().Format("2006-01-02 15:04:05"))
+			if exeErr == nil {
+				fmt.Fprintf(ef, "exe: %s\n", exePath)
+			}
+			fmt.Fprintf(ef, "config: %s\n", *configPath)
+			fmt.Fprintf(ef, "log dir: %s\n", earlyLogDir)
+			logWriters = append(logWriters, ef)
+		}
+	}
+
+	log.SetOutput(io.MultiWriter(logWriters...))
+
+	if exeErr != nil {
+		log.Printf("⚠️  無法取得 exe 路徑: %v，日誌僅輸出至 stdout", exeErr)
+	}
+
+	log.Printf("========================================")
+	log.Printf("FTPS Downloader started")
+	log.Printf("========================================")
+	log.Println()
+	log.Printf("設定檔: %s", *configPath)
+	log.Printf("日誌目錄: %s", earlyLogDir)
+
+	// 確保單一執行實例（終止舊實例）
+	if err := ensureSingleInstance(); err != nil {
+		log.Printf("❌ 執行實例檢查失敗: %v", err)
+		os.Exit(1)
 	}
 
 	overrides := map[string]bool{}
@@ -1931,6 +1951,26 @@ func formatFileSize(size int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+// quickScanLogDir 從設定檔快速讀取 log_dir，不做完整解析
+func quickScanLogDir(configPath string) string {
+	f, err := os.Open(configPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "log_dir=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "log_dir="))
+		}
+	}
+	return ""
 }
 
 // cleanOldLogs 清理超過指定天數的舊日誌檔案
@@ -2224,9 +2264,9 @@ func run(cfg *Config) error {
 		return fmt.Errorf("create local directory %s: %w", cfg.LocalDir, err)
 	}
 
-	var logWriter io.Writer = io.Discard
 	var logFile *os.File
 	var logPath string
+	logWriters := []io.Writer{os.Stdout}
 
 	if cfg.LogDir != "" {
 		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
@@ -2248,15 +2288,12 @@ func run(cfg *Config) error {
 					file.Write([]byte{0xEF, 0xBB, 0xBF})
 				}
 				logFile = file
-				logWriter = logFile
+				logWriters = append(logWriters, logFile)
 			}
 		}
 	}
 
-	if logWriter == io.Discard && os.Stdout != nil {
-		logWriter = os.Stdout
-	}
-
+	logWriter := io.MultiWriter(logWriters...)
 	log.SetOutput(logWriter)
 	if logFile != nil {
 		defer logFile.Close()
