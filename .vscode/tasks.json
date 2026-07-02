@@ -114,6 +114,42 @@
 			"type": "shell",
 			"command": "git add cmd/downloader/main.go run_ftps_downloader_monitor_hidden.vbs setup_downloader_scheduler.ps1; git commit -m 'fix: all logs go to configured log_dir with dated filenames'; git push",
 			"group": "build"
+		},
+		{
+			"label": "Commit and push all changes",
+			"type": "shell",
+			"command": "git add -A; git commit -m \"feat: add first-start remote inventory, skip zero-byte files, build win+linux\"; git push origin master",
+			"group": "build"
+		},
+		{
+			"label": "Commit and push all changes via cmd",
+			"type": "shell",
+			"command": "cmd /c \"git add -A && git commit -m \\\"feat: add first-start remote inventory, skip zero-byte files, build win+linux\\\" && git push origin master\"",
+			"group": "build"
+		},
+		{
+			"label": "Fix .git objects ACL",
+			"type": "shell",
+			"command": "cmd /c \"icacls .git\\objects /grant %USERNAME%:(OI)(CI)F /T\"",
+			"group": "build"
+		},
+		{
+			"label": "Fix .git objects ACL simple",
+			"type": "shell",
+			"command": "$u=$env:USERNAME; icacls .git\\objects /grant \"$u:F\" /T",
+			"group": "build"
+		},
+		{
+			"label": "Fix ACL with stop parsing",
+			"type": "shell",
+			"command": "icacls --% .git\\objects /grant %USERNAME%:(OI)(CI)F /T",
+			"group": "build"
+		},
+		{
+			"label": "Commit and push tasks update",
+			"type": "shell",
+			"command": "cmd /c \"git add .vscode/tasks.json && git commit -m \\\"chore: make downloader build task output win+linux\\\" && git push origin master\"",
+			"group": "build"
 		}
 	]
 }
