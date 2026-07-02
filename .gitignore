@@ -3,6 +3,7 @@
 *.dll
 *.so
 *.dylib
+ftps-downloader-linux/ftps-downloader
 
 # Test files
 *.ftps

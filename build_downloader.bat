@@ -5,6 +5,7 @@ setlocal
 set EXE_NAME=ftps-downloader.exe
 set LINUX_EXE=ftps-downloader-linux\ftps-downloader
 set LINUX_DIR=ftps-downloader-linux
+set BUILD_FAILED=0
 
 :: ===== Windows 版 =====
 echo [1/2] 編譯 Windows 版 %EXE_NAME%...
@@ -22,12 +23,14 @@ if exist %EXE_NAME% (
     del /F %EXE_NAME% 2>nul
     if exist %EXE_NAME% (
         echo   ERROR: 無法刪除 %EXE_NAME%，程式可能正在執行中
+        set BUILD_FAILED=1
         goto END
     )
     echo   舊檔案已刪除，重試編譯...
     goto TRY_BUILD_WIN
 ) else (
     echo   編譯失敗（其他原因）
+    set BUILD_FAILED=1
     goto END
 )
 
@@ -39,7 +42,7 @@ if not exist %LINUX_DIR% mkdir %LINUX_DIR%
 
 set GOOS=linux
 set GOARCH=amd64
-go build -mod=mod -o %LINUX_EXE% ./cmd/downloader
+go build -o %LINUX_EXE% ./cmd/downloader
 set GOOS=
 set GOARCH=
 
@@ -47,6 +50,7 @@ if %ERRORLEVEL% EQU 0 (
     echo   OK: %LINUX_EXE% 建立成功
 ) else (
     echo   ERROR: Linux 編譯失敗
+    set BUILD_FAILED=1
     goto END
 )
 
@@ -56,4 +60,7 @@ echo   Windows: %EXE_NAME%
 echo   Linux:   %LINUX_EXE%
 
 :END
-pause
+if %BUILD_FAILED% NEQ 0 (
+    exit /b 1
+)
+exit /b 0

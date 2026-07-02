@@ -5,7 +5,7 @@ cd /d "%~dp0"
 REM Check if executable exists, if not build it
 if not exist ftps-uploader.exe (
     echo Executable not found, building...
-    go build -o ftps-uploader.exe uploader.go
+    go build -o ftps-uploader.exe ./cmd/uploader
     if %ERRORLEVEL% NEQ 0 (
         echo Build failed!
         exit /b %ERRORLEVEL%

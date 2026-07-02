@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	"unsafe"
 
 	"github.com/jlaffaye/ftp"
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 )
 
 var (
@@ -45,12 +49,16 @@ type Config struct {
 	LocalDir           string
 	LogDir             string
 	FileNames          []PathMapping
+	UseTLS             bool
 	UseImplicitTLS     bool
 	InsecureSkipVerify bool
 	AllowedTimeRange   string // 格式: "HH:mm-HH:mm", 例如 "02:00-05:00"
 	CheckInterval      int    // 檢查間隔(分鐘)，預設 30 分鐘
 	MonitorMode        bool   // 是否啟用全天監控模式
 	StopTime           string // 自動停止時間，格式: "HH:mm", 例如 "18:00"
+	UseSFTP            bool   // 是否使用 SFTP（SSH File Transfer Protocol）
+	SSHKeyPath         string // SSH 私鑰路徑（留空則使用密碼認證）
+	SSHHostKeyCheck    bool   // 是否驗證 SSH 主機金鑰（false = 跳過驗證）
 }
 
 // cleanupOldLogs 清理超過指定天數的日誌檔案
@@ -137,6 +145,16 @@ func formatFileSize(size int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
+func parseConfigBool(value string) bool {
+	v := strings.TrimSpace(strings.ToLower(value))
+	switch v {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // ensureSingleInstance 確保只有一個程式實例在執行
 // 使用 Windows Mutex 機制，如果檢測到已有實例在執行，會終止舊實例
 func ensureSingleInstance() error {
@@ -158,7 +176,7 @@ func ensureSingleInstance() error {
 
 	// 取得 GetLastError 的值
 	lastErr, _, _ := procGetLastError.Call()
-	
+
 	const ERROR_ALREADY_EXISTS = 183
 
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -258,6 +276,7 @@ func loadConfig(path string) (*Config, error) {
 	defer file.Close()
 
 	cfg := &Config{
+		UseTLS:   true,
 		Port:     "21",
 		LocalDir: "./uploads",
 	}
@@ -307,10 +326,12 @@ func loadConfig(path string) (*Config, error) {
 			cfg.LocalDir = value
 		case "log_dir":
 			cfg.LogDir = value
+		case "use_tls":
+			cfg.UseTLS = parseConfigBool(value)
 		case "use_implicit_tls":
-			cfg.UseImplicitTLS = (value == "true")
+			cfg.UseImplicitTLS = parseConfigBool(value)
 		case "insecure_skip_verify":
-			cfg.InsecureSkipVerify = (value == "true")
+			cfg.InsecureSkipVerify = parseConfigBool(value)
 		case "allowed_time_range":
 			cfg.AllowedTimeRange = value
 		case "check_interval":
@@ -318,9 +339,15 @@ func loadConfig(path string) (*Config, error) {
 				cfg.CheckInterval = n
 			}
 		case "monitor_mode":
-			cfg.MonitorMode = (value == "true")
+			cfg.MonitorMode = parseConfigBool(value)
 		case "stop_time":
 			cfg.StopTime = value
+		case "use_sftp":
+			cfg.UseSFTP = parseConfigBool(value)
+		case "ssh_key_path":
+			cfg.SSHKeyPath = value
+		case "ssh_host_key_check":
+			cfg.SSHHostKeyCheck = parseConfigBool(value)
 		default:
 			if strings.HasPrefix(key, "file_names.") {
 				tokens := strings.Split(key, ".")
@@ -535,12 +562,12 @@ func uploadFile(client *ftp.ServerConn, localPath, remoteName string) (bool, err
 	// Check local status file
 	status := getUploadStatus(localPath)
 	statusPath := localPath + ".status"
-	
+
 	if status == "Y" {
 		// 檢查本地檔案是否在狀態標記之後被修改過
 		if statusInfo, err := os.Stat(statusPath); err == nil {
 			if localStat.ModTime().After(statusInfo.ModTime()) {
-				log.Printf("🔄 檔案已變更: %s (本地: %s, 狀態: %s)", 
+				log.Printf("🔄 檔案已變更: %s (本地: %s, 狀態: %s)",
 					filepath.Base(localPath),
 					localStat.ModTime().Format("2006-01-02 15:04:05"),
 					statusInfo.ModTime().Format("2006-01-02 15:04:05"))
@@ -577,6 +604,195 @@ func uploadFile(client *ftp.ServerConn, localPath, remoteName string) (bool, err
 	setUploadStatus(localPath, "Y")
 	log.Printf("Successfully uploaded %s", remoteName)
 	return true, nil
+}
+
+type uploadTask struct {
+	fullLocalPath string
+	remoteName    string
+}
+
+func looksLikeGuardianRemotePath(remotePath string) bool {
+	p := strings.TrimSpace(remotePath)
+	if p == "" || strings.Contains(p, "/") {
+		return false
+	}
+	return strings.Contains(p, "$") || strings.HasPrefix(p, "\\") || strings.Count(p, ".") >= 2
+}
+
+func combineUploadRemotePath(remoteDir, remoteName string) string {
+	base := strings.TrimSpace(remoteDir)
+	name := strings.TrimSpace(remoteName)
+	if base == "" || name == "" || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
+		return name
+	}
+	if looksLikeGuardianRemotePath(base) {
+		if strings.HasSuffix(base, ".") {
+			return base + name
+		}
+		return base + "." + name
+	}
+
+	base = strings.ReplaceAll(base, "\\", "/")
+	name = strings.ReplaceAll(name, "\\", "/")
+	return path.Join(base, name)
+}
+
+// newSSHClient 建立 SSH 連線，支援密碼與私鑰兩種認證方式。
+func newSSHClient(cfg *Config) (*ssh.Client, error) {
+	var authMethods []ssh.AuthMethod
+
+	if cfg.SSHKeyPath != "" {
+		keyData, err := os.ReadFile(cfg.SSHKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("讀取 SSH 私鑰失敗 %s: %w", cfg.SSHKeyPath, err)
+		}
+		signer, err := ssh.ParsePrivateKey(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("解析 SSH 私鑰失敗: %w", err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		log.Printf("🔑 使用 SSH 私鑰認證: %s", cfg.SSHKeyPath)
+	}
+	if cfg.Pass != "" {
+		authMethods = append(authMethods, ssh.Password(cfg.Pass))
+		if cfg.SSHKeyPath == "" {
+			log.Printf("🔑 使用密碼認證")
+		}
+	}
+	if len(authMethods) == 0 {
+		return nil, fmt.Errorf("SFTP 需要 pass 或 ssh_key_path")
+	}
+
+	hostKeyCallback := ssh.InsecureIgnoreHostKey()
+	if cfg.SSHHostKeyCheck {
+		hostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			log.Printf("🔐 主機金鑰指紋: %s", ssh.FingerprintSHA256(key))
+			return nil
+		}
+	}
+
+	sshCfg := &ssh.ClientConfig{
+		User:            cfg.User,
+		Auth:            authMethods,
+		HostKeyCallback: hostKeyCallback,
+		Timeout:         15 * time.Second,
+	}
+
+	addr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
+	log.Printf("SFTP 連線至 %s ...", addr)
+
+	client, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		return nil, fmt.Errorf("SSH 連線失敗: %w", err)
+	}
+	return client, nil
+}
+
+func uploadFileSFTP(sftpClient *sftp.Client, cfg *Config, localPath, remoteName string) (bool, error) {
+	localFile, err := os.Open(localPath)
+	if err != nil {
+		return false, fmt.Errorf("open local file: %w", err)
+	}
+	defer localFile.Close()
+
+	localStat, err := localFile.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat local file: %w", err)
+	}
+
+	status := getUploadStatus(localPath)
+	statusPath := localPath + ".status"
+	if status == "Y" {
+		if statusInfo, err := os.Stat(statusPath); err == nil {
+			if localStat.ModTime().After(statusInfo.ModTime()) {
+				log.Printf("🔄 檔案已變更: %s (本地: %s, 狀態: %s)",
+					filepath.Base(localPath),
+					localStat.ModTime().Format("2006-01-02 15:04:05"),
+					statusInfo.ModTime().Format("2006-01-02 15:04:05"))
+				log.Printf("   本地檔案較新，需要重新上傳")
+			} else {
+				log.Printf("⏭️  跳過上傳: %s (已上傳且未變更)", filepath.Base(localPath))
+				return false, nil
+			}
+		}
+	}
+
+	remotePath := combineUploadRemotePath(cfg.RemoteDir, remoteName)
+	if remoteInfo, err := sftpClient.Stat(remotePath); err == nil {
+		if !localStat.ModTime().After(remoteInfo.ModTime()) {
+			log.Printf("⏭️  跳過上傳: %s (遠端檔案已是最新)", remotePath)
+			setUploadStatus(localPath, "Y")
+			return false, nil
+		}
+		log.Printf("🔄 本地檔案較新: %s，重新上傳...", remotePath)
+	}
+
+	log.Printf("📤 SFTP 上傳檔案: %s → %s", filepath.Base(localPath), remotePath)
+
+	_ = sftpClient.Remove(remotePath)
+
+	remoteFile, err := sftpClient.Create(remotePath)
+	if err != nil {
+		setUploadStatus(localPath, "N")
+		return false, fmt.Errorf("sftp create %s: %w", remotePath, err)
+	}
+
+	written, copyErr := io.Copy(remoteFile, localFile)
+	closeErr := remoteFile.Close()
+	if copyErr != nil {
+		setUploadStatus(localPath, "N")
+		return false, fmt.Errorf("sftp write %s: %w", remotePath, copyErr)
+	}
+	if closeErr != nil {
+		setUploadStatus(localPath, "N")
+		return false, fmt.Errorf("sftp close %s: %w", remotePath, closeErr)
+	}
+	if written != localStat.Size() {
+		setUploadStatus(localPath, "N")
+		return false, fmt.Errorf("sftp upload size mismatch %s: expected %d bytes, wrote %d bytes", remotePath, localStat.Size(), written)
+	}
+
+	if err := sftpClient.Chtimes(remotePath, localStat.ModTime(), localStat.ModTime()); err != nil {
+		log.Printf("⚠️  無法設定遠端檔案時間 %s: %v", remotePath, err)
+	}
+
+	setUploadStatus(localPath, "Y")
+	log.Printf("Successfully uploaded %s", remotePath)
+	return true, nil
+}
+
+func uploadTasksSFTP(cfg *Config, tasks []uploadTask) error {
+	sshClient, err := newSSHClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer sshClient.Close()
+
+	sftpClient, err := sftp.NewClient(sshClient)
+	if err != nil {
+		return fmt.Errorf("建立 SFTP 客戶端失敗: %w", err)
+	}
+	defer sftpClient.Close()
+	log.Println("✓ SFTP 連線成功")
+
+	uploadCount := 0
+	for _, task := range tasks {
+		uploaded, err := uploadFileSFTP(sftpClient, cfg, task.fullLocalPath, task.remoteName)
+		if err != nil {
+			log.Printf("Error uploading %s: %v", task.fullLocalPath, err)
+			continue
+		}
+		if uploaded {
+			uploadCount++
+		}
+	}
+
+	if uploadCount == 0 {
+		log.Println("Upload process finished. No files were uploaded this time.")
+	} else {
+		log.Printf("Upload process finished. %d file(s) uploaded.", uploadCount)
+	}
+	return nil
 }
 
 // matchFileName 檢查檔案名稱是否符合指定的規則
@@ -688,6 +904,15 @@ func expandFilePatterns(localBase string, patterns []string) ([]string, error) {
 func runUpload(cfg *Config) error {
 	// Log configuration summary
 	log.Printf("Configuration: Host=%s, Port=%s, User=%s", cfg.Host, cfg.Port, cfg.User)
+	if cfg.UseSFTP {
+		log.Printf("Protocol: SFTP")
+	} else if !cfg.UseTLS {
+		log.Printf("Protocol: FTP")
+	} else if cfg.UseImplicitTLS {
+		log.Printf("Protocol: FTPS - Implicit TLS")
+	} else {
+		log.Printf("Protocol: FTPS - Explicit TLS")
+	}
 	log.Printf("Local directory: %s", cfg.LocalDir)
 	if cfg.RemoteDir != "" {
 		log.Printf("Remote directory: %s", cfg.RemoteDir)
@@ -707,10 +932,6 @@ func runUpload(cfg *Config) error {
 	}
 
 	// 2. Collect files that actually exist
-	type uploadTask struct {
-		fullLocalPath string
-		remoteName    string
-	}
 	var tasks []uploadTask
 
 	for _, mapping := range cfg.FileNames {
@@ -736,7 +957,7 @@ func runUpload(cfg *Config) error {
 
 			if _, err := os.Stat(fullLocalPath); err == nil {
 				fileName := filepath.Base(fullLocalPath)
-				
+
 				// 檢查是否被排除
 				isExcluded := false
 				for _, exclude := range mapping.ExcludeFiles {
@@ -806,8 +1027,12 @@ func runUpload(cfg *Config) error {
 	}
 
 	if len(tasks) == 0 {
-		log.Println("No local files found for upload. Skipping FTP connection.")
+		log.Println("No local files found for upload. Skipping remote connection.")
 		return nil
+	}
+
+	if cfg.UseSFTP {
+		return uploadTasksSFTP(cfg, tasks)
 	}
 
 	// 3. Connect to FTP only if there are files to upload
@@ -823,10 +1048,12 @@ func runUpload(cfg *Config) error {
 		ftp.DialWithTimeout(15 * time.Second),
 	}
 
-	if cfg.UseImplicitTLS {
-		dialOptions = append(dialOptions, ftp.DialWithTLS(tlsConfig))
-	} else {
-		dialOptions = append(dialOptions, ftp.DialWithExplicitTLS(tlsConfig))
+	if cfg.UseTLS {
+		if cfg.UseImplicitTLS {
+			dialOptions = append(dialOptions, ftp.DialWithTLS(tlsConfig))
+		} else {
+			dialOptions = append(dialOptions, ftp.DialWithExplicitTLS(tlsConfig))
+		}
 	}
 
 	client, err := ftp.Dial(addr, dialOptions...)
@@ -885,44 +1112,61 @@ func run(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("configuration is nil")
 	}
-	
+
 	// ========================================
 	// 參數驗證
 	// ========================================
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Println("【參數驗證】檢查設定檔參數...")
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	
+
 	cfg.Host = strings.TrimSpace(cfg.Host)
 	cfg.Port = strings.TrimSpace(cfg.Port)
-	
+
+	protocolName := "FTP/FTPS"
+	if cfg.UseSFTP {
+		protocolName = "SFTP"
+	}
+
 	// 驗證必要參數
 	if cfg.Host == "" {
 		return fmt.Errorf("❌ 驗證失敗: host 參數未設定")
 	}
-	log.Printf("✓ FTP 主機: %s", cfg.Host)
-	
+	log.Printf("✓ %s 主機: %s", protocolName, cfg.Host)
+
 	if cfg.Port == "" {
-		cfg.Port = "21"
-		log.Printf("ℹ️  FTP 埠號: %s (使用預設值)", cfg.Port)
+		if cfg.UseSFTP {
+			cfg.Port = "22"
+		} else {
+			cfg.Port = "21"
+		}
+		log.Printf("ℹ️  %s 埠號: %s (使用預設值)", protocolName, cfg.Port)
+	} else if cfg.UseSFTP && cfg.Port == "21" {
+		cfg.Port = "22"
+		log.Printf("ℹ️  SFTP 埠號: %s (use_sftp=true 且未指定 SFTP port，使用預設值)", cfg.Port)
 	} else {
 		// 驗證埠號格式
 		if port, err := strconv.Atoi(cfg.Port); err != nil || port < 1 || port > 65535 {
 			return fmt.Errorf("❌ 驗證失敗: port 參數無效 (%s)，必須是 1-65535 之間的數字", cfg.Port)
 		}
-		log.Printf("✓ FTP 埠號: %s", cfg.Port)
+		log.Printf("✓ %s 埠號: %s", protocolName, cfg.Port)
 	}
-	
+
 	if cfg.User == "" {
 		return fmt.Errorf("❌ 驗證失敗: user 參數未設定")
 	}
-	log.Printf("✓ FTP 帳號: %s", cfg.User)
-	
-	if cfg.Pass == "" {
+	log.Printf("✓ %s 帳號: %s", protocolName, cfg.User)
+
+	if cfg.Pass == "" && !(cfg.UseSFTP && cfg.SSHKeyPath != "") {
 		return fmt.Errorf("❌ 驗證失敗: pass 參數未設定")
 	}
-	log.Printf("✓ FTP 密碼: %s", strings.Repeat("*", len(cfg.Pass)))
-	
+	if cfg.Pass != "" {
+		log.Printf("✓ %s 密碼: %s", protocolName, strings.Repeat("*", len(cfg.Pass)))
+	}
+	if cfg.UseSFTP && cfg.SSHKeyPath != "" {
+		log.Printf("✓ SSH 私鑰: %s", cfg.SSHKeyPath)
+	}
+
 	// 驗證目錄設定
 	if cfg.LocalDir == "" {
 		cfg.LocalDir = "./uploads"
@@ -930,18 +1174,18 @@ func run(cfg *Config) error {
 	} else {
 		log.Printf("✓ 本地目錄: %s", cfg.LocalDir)
 	}
-	
+
 	if cfg.RemoteDir != "" {
 		log.Printf("✓ 遠端目錄: %s", cfg.RemoteDir)
 	}
-	
+
 	// 驗證監控模式參數
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = 30
 	}
 	if cfg.MonitorMode {
 		log.Printf("✓ 監控模式: 已啟用 (間隔: %d 分鐘)", cfg.CheckInterval)
-		
+
 		// 驗證時間範圍格式
 		if cfg.AllowedTimeRange != "" {
 			if _, err := isWithinTimeRange(cfg.AllowedTimeRange); err != nil {
@@ -949,7 +1193,7 @@ func run(cfg *Config) error {
 			}
 			log.Printf("✓ 時間範圍: %s", cfg.AllowedTimeRange)
 		}
-		
+
 		// 驗證停止時間格式
 		if cfg.StopTime != "" {
 			if _, err := shouldStopMonitor(cfg.StopTime); err != nil {
@@ -958,25 +1202,35 @@ func run(cfg *Config) error {
 			log.Printf("✓ 停止時間: %s", cfg.StopTime)
 		}
 	}
-	
-	// 驗證 TLS 設定
-	if cfg.UseImplicitTLS {
-		log.Printf("✓ TLS 模式: Implicit TLS (通常使用 port 990)")
+
+	// 驗證通訊協議設定
+	if cfg.UseSFTP {
+		log.Printf("✓ 通訊協議: SFTP")
+		if cfg.SSHHostKeyCheck {
+			log.Printf("✓ SSH 主機金鑰檢查: 已啟用")
+		} else {
+			log.Printf("⚠️  SSH 主機金鑰檢查: 已停用 (ssh_host_key_check=false)")
+		}
 	} else {
-		log.Printf("✓ TLS 模式: Explicit TLS")
+		if !cfg.UseTLS {
+			log.Printf("✓ 連線模式: 純文字 FTP（無加密）")
+		} else if cfg.UseImplicitTLS {
+			log.Printf("✓ TLS 模式: Implicit TLS (通常使用 port 990)")
+		} else {
+			log.Printf("✓ TLS 模式: Explicit TLS")
+		}
+		if cfg.UseTLS && cfg.InsecureSkipVerify {
+			log.Printf("⚠️  SSL 驗證: 已停用 (insecure_skip_verify=true)")
+		}
 	}
-	
-	if cfg.InsecureSkipVerify {
-		log.Printf("⚠️  SSL 驗證: 已停用 (insecure_skip_verify=true)")
-	}
-	
+
 	// 驗證檔案設定
 	if len(cfg.FileNames) == 0 {
 		log.Printf("⚠️  警告: 未設定上傳檔案，將無檔案可上傳")
 	} else {
 		log.Printf("✓ 上傳模式: 指定檔案清單 (%d 個路徑)", len(cfg.FileNames))
 	}
-	
+
 	log.Println("✓ 參數驗證通過")
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Println()

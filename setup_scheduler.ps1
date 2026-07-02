@@ -10,7 +10,7 @@ $HiddenExePath = Join-Path $WorkingDir "ftps-uploader-hidden.exe"
 if (-not (Test-Path $HiddenExePath)) {
     Write-Host "Building hidden uploader executable..." -ForegroundColor Yellow
     Set-Location $WorkingDir
-    go build -ldflags="-H=windowsgui" -o ftps-uploader-hidden.exe uploader.go
+    go build -ldflags="-H=windowsgui" -o ftps-uploader-hidden.exe ./cmd/uploader
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Build successful!" -ForegroundColor Green
     } else {

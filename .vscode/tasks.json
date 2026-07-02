@@ -1,0 +1,119 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build downloader",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Vendor and build downloader",
+			"type": "shell",
+			"command": "go mod vendor; go build -mod=vendor ./cmd/downloader/",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ftps-downloader.exe",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ftps-downloader.exe (2)",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ftps-downloader.exe (3)",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ftps-downloader.exe (4)",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ftps-downloader.exe (5)",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build downloader Win+Linux",
+			"type": "shell",
+			"command": "cmd /c build_downloader.bat",
+			"problemMatcher": [
+				"$go"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Git status",
+			"type": "shell",
+			"command": "git add -A && git status",
+			"group": "build"
+		},
+		{
+			"label": "Git status check",
+			"type": "shell",
+			"command": "git status",
+			"group": "build"
+		},
+		{
+			"label": "Git commit and push",
+			"type": "shell",
+			"command": "git add cmd/downloader/main.go run_ftps_downloader_monitor_hidden.vbs setup_downloader_scheduler.ps1 && git commit -m \"fix: all logs go to configured log_dir with dated filenames\" && git push",
+			"group": "build"
+		},
+		{
+			"label": "Fix git permissions",
+			"type": "shell",
+			"command": "icacls \".git\\objects\" /grant \"%USERNAME%:(OI)(CI)F\" /T 2>&1 | Select-Object -Last 5",
+			"group": "build"
+		},
+		{
+			"label": "Fix perms and push",
+			"type": "shell",
+			"command": "cmd /c \"icacls .git\\objects /grant %USERNAME%:(OI)(CI)F /T\" && git add cmd/downloader/main.go run_ftps_downloader_monitor_hidden.vbs setup_downloader_scheduler.ps1 && git commit -m \"fix: all logs go to configured log_dir with dated filenames\" && git push",
+			"group": "build"
+		},
+		{
+			"label": "Git push retry",
+			"type": "shell",
+			"command": "git config core.fileMode false && git add cmd/downloader/main.go run_ftps_downloader_monitor_hidden.vbs setup_downloader_scheduler.ps1 && git commit -m \"fix: all logs go to configured log_dir with dated filenames\" && git push",
+			"group": "build"
+		},
+		{
+			"label": "Git commit push final",
+			"type": "shell",
+			"command": "git add cmd/downloader/main.go run_ftps_downloader_monitor_hidden.vbs setup_downloader_scheduler.ps1; git commit -m 'fix: all logs go to configured log_dir with dated filenames'; git push",
+			"group": "build"
+		}
+	]
+}
