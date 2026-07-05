@@ -71,6 +71,11 @@ type Config struct {
 	UseSFTP            bool     // 是否使用 SFTP（SSH File Transfer Protocol）
 	SSHKeyPath         string   // SSH 私鑰路徑（留空則使用密碼認證）
 	SSHHostKeyCheck    bool     // 是否驗證 SSH 主機金鑰（false = 跳過驗證）
+	RequireRemoteMeta  bool     // 嚴格模式：下載前必須取得遠端日期與大小
+	DisableSIZEProbe   bool     // 伺服器不支援 SIZE 時，停用後續 SIZE 探測
+	DisableMDTMProbe   bool     // 伺服器不支援 MDTM 時，停用後續 MDTM 探測
+	LoggedSIZEProbeOff bool     // 只記錄一次 SIZE 停用訊息
+	LoggedMDTMProbeOff bool     // 只記錄一次 MDTM 停用訊息
 }
 
 type fileSpecList []string
@@ -282,6 +287,7 @@ func loadConfig(path string) (*Config, error) {
 		GuardianAddCRLF:    true,
 		FlagFileName:       "DATCLOSE",
 		AutoDeleteFlagFile: true,
+		RequireRemoteMeta:  true,
 	}
 
 	scanner := bufio.NewScanner(file)
@@ -391,6 +397,8 @@ func loadConfig(path string) (*Config, error) {
 			cfg.SSHKeyPath = value
 		case "ssh_host_key_check":
 			cfg.SSHHostKeyCheck = parseConfigBool(value)
+		case "require_remote_metadata":
+			cfg.RequireRemoteMeta = parseConfigBool(value)
 		default:
 			if strings.HasPrefix(key, "file_names.") {
 				tokens := strings.Split(key, ".")
@@ -599,7 +607,7 @@ func shouldDownloadExistingFileFromInfo(localSize int64, recordedTime time.Time,
 	if localSize != recordedSize {
 		return true, fmt.Sprintf("無遠端時間/大小資訊，本地大小與記錄不同 (本地: %d bytes, 記錄: %d bytes)", localSize, recordedSize)
 	}
-	return false, fmt.Sprintf("無遠端時間/大小資訊，本地大小與記錄一致 (%d bytes)", localSize)
+	return true, fmt.Sprintf("無遠端時間/大小資訊（伺服器不支援 SIZE/MDTM/LIST metadata），改為保守重抓 (本地: %d bytes)", localSize)
 }
 
 func remoteFileIsKnownEmpty(remoteSize int64, sizeOK bool) bool {
@@ -733,21 +741,238 @@ func getRemoteInfoByMLST(client *ftp.ServerConn, remotePath string) remoteFileIn
 	return info
 }
 
+func isUnsupportedSizeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "size") &&
+		(strings.Contains(msg, "not understood") || strings.Contains(msg, "not supported") || strings.Contains(msg, "not implemented"))
+}
+
+func isUnsupportedMDTMErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "gettime is not supported") {
+		return true
+	}
+	return strings.Contains(msg, "mdtm") &&
+		(strings.Contains(msg, "not understood") || strings.Contains(msg, "not supported") || strings.Contains(msg, "not implemented"))
+}
+
+func getRemoteSizeWithFallback(client *ftp.ServerConn, cfg *Config, remotePath string) (int64, bool) {
+	if cfg.DisableSIZEProbe {
+		return -1, false
+	}
+
+	tryPaths := []string{remotePath}
+	trimmed := strings.TrimSpace(strings.TrimPrefix(remotePath, `\\`))
+	if trimmed != "" && trimmed != remotePath {
+		tryPaths = append(tryPaths, trimmed)
+	}
+
+	seen := make(map[string]bool)
+	for _, p := range tryPaths {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		size, err := client.FileSize(p)
+		if err == nil {
+			return size, true
+		}
+		if isUnsupportedSizeErr(err) {
+			cfg.DisableSIZEProbe = true
+			if cfg.DebugList && !cfg.LoggedSIZEProbeOff {
+				log.Printf("  ℹ️  伺服器不支援 SIZE，後續停用 SIZE 探測")
+				cfg.LoggedSIZEProbeOff = true
+			}
+			return -1, false
+		}
+		if cfg.DebugList {
+			log.Printf("  ⚠️  SIZE 失敗 %s: %v", p, err)
+		}
+	}
+
+	remoteDir, remoteFileName := parseRemotePath(remotePath)
+	if remoteDir == "" || remoteFileName == "" {
+		return -1, false
+	}
+
+	originalDir, pwdErr := client.CurrentDir()
+	dirCandidates := []string{remoteDir, strings.TrimPrefix(remoteDir, `\\`)}
+	dirChanged := false
+	activeDir := ""
+	for _, dir := range dirCandidates {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		if err := client.ChangeDir(dir); err == nil {
+			dirChanged = true
+			activeDir = dir
+			break
+		} else if cfg.DebugList {
+			log.Printf("  ⚠️  CWD 失敗 %s: %v", dir, err)
+		}
+	}
+	if !dirChanged {
+		return -1, false
+	}
+
+	defer func() {
+		if pwdErr == nil && strings.TrimSpace(originalDir) != "" {
+			if err := client.ChangeDir(originalDir); err != nil && cfg.DebugList {
+				log.Printf("  ⚠️  回復目錄失敗 %s (from %s): %v", originalDir, activeDir, err)
+			}
+		}
+	}()
+
+	nameCandidates := []string{remoteFileName, strings.TrimPrefix(remoteFileName, `\\`)}
+	seenName := make(map[string]bool)
+	for _, name := range nameCandidates {
+		name = strings.TrimSpace(name)
+		if name == "" || seenName[name] {
+			continue
+		}
+		seenName[name] = true
+		size, err := client.FileSize(name)
+		if err == nil {
+			if cfg.DebugList {
+				log.Printf("  ✓ CWD+SIZE 成功 %s/%s: %d", activeDir, name, size)
+			}
+			return size, true
+		}
+		if isUnsupportedSizeErr(err) {
+			cfg.DisableSIZEProbe = true
+			if cfg.DebugList && !cfg.LoggedSIZEProbeOff {
+				log.Printf("  ℹ️  伺服器不支援 SIZE，後續停用 SIZE 探測")
+				cfg.LoggedSIZEProbeOff = true
+			}
+			return -1, false
+		}
+		if cfg.DebugList {
+			log.Printf("  ⚠️  CWD+SIZE 失敗 %s/%s: %v", activeDir, name, err)
+		}
+	}
+
+	return -1, false
+}
+
+func getRemoteTimeWithFallback(client *ftp.ServerConn, cfg *Config, remotePath string) (time.Time, bool) {
+	if cfg.DisableMDTMProbe {
+		return time.Time{}, false
+	}
+
+	tryPaths := []string{remotePath}
+	trimmed := strings.TrimSpace(strings.TrimPrefix(remotePath, `\\`))
+	if trimmed != "" && trimmed != remotePath {
+		tryPaths = append(tryPaths, trimmed)
+	}
+
+	seen := make(map[string]bool)
+	for _, p := range tryPaths {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		modTime, err := client.GetTime(p)
+		if err == nil {
+			return modTime, true
+		}
+		if isUnsupportedMDTMErr(err) {
+			cfg.DisableMDTMProbe = true
+			if cfg.DebugList && !cfg.LoggedMDTMProbeOff {
+				log.Printf("  ℹ️  伺服器不支援 MDTM，後續停用 MDTM 探測")
+				cfg.LoggedMDTMProbeOff = true
+			}
+			return time.Time{}, false
+		}
+		if cfg.DebugList {
+			log.Printf("  ⚠️  MDTM 失敗 %s: %v", p, err)
+		}
+	}
+
+	remoteDir, remoteFileName := parseRemotePath(remotePath)
+	if remoteDir == "" || remoteFileName == "" {
+		return time.Time{}, false
+	}
+
+	originalDir, pwdErr := client.CurrentDir()
+	dirCandidates := []string{remoteDir, strings.TrimPrefix(remoteDir, `\\`)}
+	dirChanged := false
+	activeDir := ""
+	for _, dir := range dirCandidates {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		if err := client.ChangeDir(dir); err == nil {
+			dirChanged = true
+			activeDir = dir
+			break
+		} else if cfg.DebugList {
+			log.Printf("  ⚠️  CWD 失敗 %s: %v", dir, err)
+		}
+	}
+	if !dirChanged {
+		return time.Time{}, false
+	}
+
+	defer func() {
+		if pwdErr == nil && strings.TrimSpace(originalDir) != "" {
+			if err := client.ChangeDir(originalDir); err != nil && cfg.DebugList {
+				log.Printf("  ⚠️  回復目錄失敗 %s (from %s): %v", originalDir, activeDir, err)
+			}
+		}
+	}()
+
+	nameCandidates := []string{remoteFileName, strings.TrimPrefix(remoteFileName, `\\`)}
+	seenName := make(map[string]bool)
+	for _, name := range nameCandidates {
+		name = strings.TrimSpace(name)
+		if name == "" || seenName[name] {
+			continue
+		}
+		seenName[name] = true
+		modTime, err := client.GetTime(name)
+		if err == nil {
+			if cfg.DebugList {
+				log.Printf("  ✓ CWD+MDTM 成功 %s/%s: %s", activeDir, name, modTime.Format("2006-01-02 15:04:05"))
+			}
+			return modTime, true
+		}
+		if isUnsupportedMDTMErr(err) {
+			cfg.DisableMDTMProbe = true
+			if cfg.DebugList && !cfg.LoggedMDTMProbeOff {
+				log.Printf("  ℹ️  伺服器不支援 MDTM，後續停用 MDTM 探測")
+				cfg.LoggedMDTMProbeOff = true
+			}
+			return time.Time{}, false
+		}
+		if cfg.DebugList {
+			log.Printf("  ⚠️  CWD+MDTM 失敗 %s/%s: %v", activeDir, name, err)
+		}
+	}
+
+	return time.Time{}, false
+}
+
 func getRemoteFileInfo(client *ftp.ServerConn, cfg *Config, remotePath string) (time.Time, int64, bool, bool) {
 	info := newRemoteFileInfo()
 
-	if size, err := client.FileSize(remotePath); err == nil {
+	if size, ok := getRemoteSizeWithFallback(client, cfg, remotePath); ok {
 		info.size = size
 		info.sizeAvailable = true
-	} else if cfg.DebugList {
-		log.Printf("  ⚠️  SIZE 失敗 %s: %v", remotePath, err)
 	}
 
-	if modTime, err := client.GetTime(remotePath); err == nil {
+	if modTime, ok := getRemoteTimeWithFallback(client, cfg, remotePath); ok {
 		info.modTime = modTime
 		info.timeAvailable = true
-	} else if cfg.DebugList {
-		log.Printf("  ⚠️  MDTM 失敗 %s: %v", remotePath, err)
 	}
 
 	if !info.timeAvailable || !info.sizeAvailable {
@@ -763,7 +988,93 @@ func getRemoteFileInfo(client *ftp.ServerConn, cfg *Config, remotePath string) (
 		info.merge(listInfo)
 	}
 
+	if !info.timeAvailable || !info.sizeAvailable {
+		nameListInfo := getRemoteInfoByNameListProbe(client, cfg, remotePath)
+		if cfg.DebugList && (nameListInfo.timeAvailable || nameListInfo.sizeAvailable) {
+			log.Printf("  ✓ NAMELIST probe 取得 %s: time=%v size=%d", remotePath, nameListInfo.modTime, nameListInfo.size)
+		}
+		info.merge(nameListInfo)
+	}
+
 	return info.modTime, info.size, info.timeAvailable, info.sizeAvailable
+}
+
+func getRemoteInfoByNameListProbe(client *ftp.ServerConn, cfg *Config, remotePath string) remoteFileInfo {
+	info := newRemoteFileInfo()
+	remoteDir, remoteFileName := parseRemotePath(remotePath)
+
+	for _, listPath := range remoteListTargets(remoteDir, remotePath) {
+		names, err := client.NameList(listPath)
+		if err != nil {
+			if cfg.DebugList {
+				log.Printf("  ⚠️  NAMELIST 失敗 %s: %v", listPath, err)
+			}
+			continue
+		}
+
+		for _, name := range names {
+			if !remoteNameMatches(name, remoteFileName) {
+				continue
+			}
+
+			candidates := []string{
+				strings.TrimSpace(name),
+				combineRemotePath(remoteDir, strings.TrimSpace(name)),
+				combineRemotePath(remoteDir, remoteFileName),
+				remotePath,
+				remoteFileName,
+			}
+
+			seen := make(map[string]bool)
+			for _, candidate := range candidates {
+				candidate = strings.TrimSpace(candidate)
+				if candidate == "" || seen[candidate] {
+					continue
+				}
+				seen[candidate] = true
+
+				if !info.sizeAvailable {
+					if cfg.DisableSIZEProbe {
+						// no-op
+					} else if size, sizeErr := client.FileSize(candidate); sizeErr == nil {
+						info.size = size
+						info.sizeAvailable = true
+					} else if isUnsupportedSizeErr(sizeErr) {
+						cfg.DisableSIZEProbe = true
+						if cfg.DebugList && !cfg.LoggedSIZEProbeOff {
+							log.Printf("  ℹ️  伺服器不支援 SIZE，後續停用 SIZE 探測")
+							cfg.LoggedSIZEProbeOff = true
+						}
+					} else if cfg.DebugList {
+						log.Printf("  ⚠️  NAMELIST probe SIZE 失敗 %s: %v", candidate, sizeErr)
+					}
+				}
+
+				if !info.timeAvailable {
+					if cfg.DisableMDTMProbe {
+						// no-op
+					} else if modTime, timeErr := client.GetTime(candidate); timeErr == nil {
+						info.modTime = modTime
+						info.timeAvailable = true
+					} else if isUnsupportedMDTMErr(timeErr) {
+						cfg.DisableMDTMProbe = true
+						if cfg.DebugList && !cfg.LoggedMDTMProbeOff {
+							log.Printf("  ℹ️  伺服器不支援 MDTM，後續停用 MDTM 探測")
+							cfg.LoggedMDTMProbeOff = true
+						}
+					} else if cfg.DebugList {
+						log.Printf("  ⚠️  NAMELIST probe MDTM 失敗 %s: %v", candidate, timeErr)
+					}
+				}
+
+				if info.timeAvailable && info.sizeAvailable {
+					return info
+				}
+			}
+		}
+	}
+
+	return info
 }
 
 func getRemoteInfoByList(client *ftp.ServerConn, cfg *Config, remotePath string) remoteFileInfo {
@@ -868,12 +1179,20 @@ func initialSnapshotMarkerPath(cfg *Config) string {
 	return filepath.Join(initialSnapshotBaseDir(cfg), ".initial_remote_listing_done")
 }
 
-func shouldCreateInitialSnapshot(cfg *Config) bool {
+func resetInitialSnapshotArtifacts(cfg *Config) {
 	if cfg == nil {
-		return false
+		return
 	}
-	_, err := os.Stat(initialSnapshotMarkerPath(cfg))
-	return os.IsNotExist(err)
+
+	reportPath := filepath.Join(initialSnapshotBaseDir(cfg), "initial-remote-file-list.txt")
+	if err := os.Remove(reportPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("⚠️  無法刪除舊的遠端清單檔案 %s: %v", reportPath, err)
+	}
+
+	markerPath := initialSnapshotMarkerPath(cfg)
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("⚠️  無法刪除舊的快照旗標檔案 %s: %v", markerPath, err)
+	}
 }
 
 func writeInitialSnapshot(cfg *Config, title string, pathToFiles map[string][]string, pathErrors map[string]error) (string, error) {
@@ -883,7 +1202,7 @@ func writeInitialSnapshot(cfg *Config, title string, pathToFiles map[string][]st
 	}
 
 	now := time.Now()
-	reportPath := filepath.Join(baseDir, fmt.Sprintf("initial-remote-file-list-%s.txt", now.Format("20060102-150405")))
+	reportPath := filepath.Join(baseDir, "initial-remote-file-list.txt")
 
 	var sb strings.Builder
 	sb.WriteString(title)
@@ -1045,16 +1364,14 @@ func listRemoteFilesSFTP(sftpClient *sftp.Client, remotePath string) ([]string, 
 }
 
 func captureInitialRemoteSnapshotFTP(client *ftp.ServerConn, cfg *Config) {
-	if !shouldCreateInitialSnapshot(cfg) {
-		return
-	}
+	resetInitialSnapshotArtifacts(cfg)
 
 	paths := configuredRemotePaths(cfg)
 	if len(paths) == 0 {
 		return
 	}
 
-	log.Printf("🧭 首次啟動：開始建立遠端檔名清單快照 (FTP)")
+	log.Printf("🧭 啟動時：開始重建遠端檔名清單快照 (FTP)")
 	pathToFiles := make(map[string][]string, len(paths))
 	pathErrors := make(map[string]error)
 
@@ -1063,33 +1380,31 @@ func captureInitialRemoteSnapshotFTP(client *ftp.ServerConn, cfg *Config) {
 		if err != nil {
 			pathErrors[remotePath] = err
 			pathToFiles[remotePath] = []string{}
-			log.Printf("⚠️  首次快照無法列出路徑 %s: %v", remotePath, err)
+			log.Printf("⚠️  重建快照無法列出路徑 %s: %v", remotePath, err)
 			continue
 		}
 		pathToFiles[remotePath] = files
-		log.Printf("📝 首次快照路徑 %s: %d 個檔案", remotePath, len(files))
+		log.Printf("📝 重建快照路徑 %s: %d 個檔案", remotePath, len(files))
 	}
 
-	reportPath, err := writeInitialSnapshot(cfg, "FTPS Downloader 初次啟動遠端檔名清單 (FTP)", pathToFiles, pathErrors)
+	reportPath, err := writeInitialSnapshot(cfg, "FTPS Downloader 啟動時遠端檔名清單 (FTP)", pathToFiles, pathErrors)
 	if err != nil {
-		log.Printf("⚠️  寫入首次快照失敗: %v", err)
+		log.Printf("⚠️  寫入重建快照失敗: %v", err)
 		return
 	}
 
-	log.Printf("✅ 首次遠端檔名清單已寫入: %s", reportPath)
+	log.Printf("✅ 遠端檔名清單已重建: %s", reportPath)
 }
 
 func captureInitialRemoteSnapshotSFTP(sftpClient *sftp.Client, cfg *Config) {
-	if !shouldCreateInitialSnapshot(cfg) {
-		return
-	}
+	resetInitialSnapshotArtifacts(cfg)
 
 	paths := configuredRemotePaths(cfg)
 	if len(paths) == 0 {
 		return
 	}
 
-	log.Printf("🧭 首次啟動：開始建立遠端檔名清單快照 (SFTP)")
+	log.Printf("🧭 啟動時：開始重建遠端檔名清單快照 (SFTP)")
 	pathToFiles := make(map[string][]string, len(paths))
 	pathErrors := make(map[string]error)
 
@@ -1098,20 +1413,20 @@ func captureInitialRemoteSnapshotSFTP(sftpClient *sftp.Client, cfg *Config) {
 		if err != nil {
 			pathErrors[remotePath] = err
 			pathToFiles[remotePath] = []string{}
-			log.Printf("⚠️  首次快照無法列出路徑 %s: %v", remotePath, err)
+			log.Printf("⚠️  重建快照無法列出路徑 %s: %v", remotePath, err)
 			continue
 		}
 		pathToFiles[remotePath] = files
-		log.Printf("📝 首次快照路徑 %s: %d 個檔案", remotePath, len(files))
+		log.Printf("📝 重建快照路徑 %s: %d 個檔案", remotePath, len(files))
 	}
 
-	reportPath, err := writeInitialSnapshot(cfg, "FTPS Downloader 初次啟動遠端檔名清單 (SFTP)", pathToFiles, pathErrors)
+	reportPath, err := writeInitialSnapshot(cfg, "FTPS Downloader 啟動時遠端檔名清單 (SFTP)", pathToFiles, pathErrors)
 	if err != nil {
-		log.Printf("⚠️  寫入首次快照失敗: %v", err)
+		log.Printf("⚠️  寫入重建快照失敗: %v", err)
 		return
 	}
 
-	log.Printf("✅ 首次遠端檔名清單已寫入: %s", reportPath)
+	log.Printf("✅ 遠端檔名清單已重建: %s", reportPath)
 }
 
 // parseNonStopListOutput 透過原始 LIST 輸出解析 NonStop/Guardian 檔案時間與大小。
@@ -1119,7 +1434,7 @@ func parseNonStopListOutput(client *ftp.ServerConn, listPath, remoteFileName str
 	info := newRemoteFileInfo()
 	lines, err := ftpRawList(client, listPath)
 	if err != nil {
-		if debug {
+		if debug && !strings.Contains(strings.ToLower(err.Error()), "rawlist not supported") {
 			log.Printf("  ⚠️  Raw LIST 失敗 %s: %v", listPath, err)
 		}
 		return info
@@ -1129,6 +1444,10 @@ func parseNonStopListOutput(client *ftp.ServerConn, listPath, remoteFileName str
 		if debug {
 			log.Printf("     [RAW %d] %s", i, line)
 		}
+		parsedMLSD, okMLSD := parseMLSDFactsLine(line, remoteFileName)
+		if okMLSD {
+			return parsedMLSD
+		}
 		parsed, ok := parseNonStopListLine(line, remoteFileName)
 		if !ok {
 			continue
@@ -1137,6 +1456,79 @@ func parseNonStopListOutput(client *ftp.ServerConn, listPath, remoteFileName str
 	}
 
 	return info
+}
+
+func parseMLSDFactsLine(line, remoteFileName string) (remoteFileInfo, bool) {
+	info := newRemoteFileInfo()
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.Contains(trimmed, "=") || !strings.Contains(trimmed, ";") {
+		return info, false
+	}
+
+	parts := strings.Fields(trimmed)
+	if len(parts) == 0 {
+		return info, false
+	}
+
+	factsPart := parts[0]
+	namePart := ""
+	if len(parts) > 1 {
+		namePart = strings.Join(parts[1:], " ")
+	}
+
+	if namePart == "" || !remoteNameMatches(namePart, remoteFileName) {
+		return info, false
+	}
+
+	for _, fact := range strings.Split(factsPart, ";") {
+		fact = strings.TrimSpace(fact)
+		if fact == "" {
+			continue
+		}
+
+		kv := strings.SplitN(fact, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+
+		switch key {
+		case "size":
+			if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+				info.size = n
+				info.sizeAvailable = true
+			}
+		case "modify":
+			if ts, ok := parseMLSDFactTime(value); ok {
+				info.modTime = ts
+				info.timeAvailable = true
+			}
+		}
+	}
+
+	if !info.timeAvailable && !info.sizeAvailable {
+		return info, false
+	}
+
+	return info, true
+}
+
+func parseMLSDFactTime(value string) (time.Time, bool) {
+	v := strings.TrimSpace(value)
+	if len(v) < 14 {
+		return time.Time{}, false
+	}
+
+	// RFC3659 modify=YYYYMMDDHHMMSS[.sss]
+	base := v[:14]
+	ts, err := time.Parse("20060102150405", base)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return ts.UTC(), true
 }
 
 func parseNonStopListLine(line, remoteFileName string) (remoteFileInfo, bool) {
@@ -1160,6 +1552,14 @@ func parseNonStopListLine(line, remoteFileName string) (remoteFileInfo, bool) {
 	for dateIdx := 0; dateIdx < len(fields)-1; dateIdx++ {
 		parsedTime, ok := parseListDateTime(fields[dateIdx], fields[dateIdx+1])
 		if !ok {
+			if dateIdx+2 < len(fields) {
+				if parsedWithMeridiem, okMeridiem := parseListDateTimeWithMeridiem(fields[dateIdx], fields[dateIdx+1], fields[dateIdx+2]); okMeridiem {
+					parsedTime = parsedWithMeridiem
+					ok = true
+				}
+			}
+		}
+		if !ok {
 			continue
 		}
 
@@ -1175,6 +1575,18 @@ func parseNonStopListLine(line, remoteFileName string) (remoteFileInfo, bool) {
 		return info, true
 	}
 
+	// 有些 Guardian LIST 行不含可解析的時間欄位，先至少回傳大小供比對。
+	if size, ok := parseLastInteger(fields, nameIdx+1, len(fields)); ok {
+		info.size = size
+		info.sizeAvailable = true
+		return info, true
+	}
+	if size, ok := parseLastInteger(fields, 0, nameIdx); ok {
+		info.size = size
+		info.sizeAvailable = true
+		return info, true
+	}
+
 	return info, false
 }
 
@@ -1187,6 +1599,7 @@ func parseLastInteger(fields []string, start, end int) (int64, bool) {
 	}
 	for i := end - 1; i >= start; i-- {
 		value := strings.Trim(fields[i], ",;")
+		value = strings.ReplaceAll(value, ",", "")
 		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return n, true
 		}
@@ -1197,6 +1610,10 @@ func parseLastInteger(fields []string, start, end int) (int64, bool) {
 func parseListDateTime(dateField, timeField string) (time.Time, bool) {
 	dateTime := strings.Trim(dateField, ",;") + " " + strings.Trim(timeField, ",;")
 	layouts := []string{
+		"2006/1/2 15:04:05",
+		"2006/1/2 15:04",
+		"2006/01/02 15:04:05",
+		"2006/01/02 15:04",
 		"_2-Jan-06 15:04:05",
 		"_2-Jan-2006 15:04:05",
 		"02-Jan-06 15:04:05",
@@ -1205,14 +1622,64 @@ func parseListDateTime(dateField, timeField string) (time.Time, bool) {
 		"_2-Jan-2006 15:04",
 		"02-Jan-06 15:04",
 		"02-Jan-2006 15:04",
+		"_2Jan06 15:04:05",
+		"_2Jan2006 15:04:05",
+		"02Jan06 15:04:05",
+		"02Jan2006 15:04:05",
+		"_2Jan06 15:04",
+		"_2Jan2006 15:04",
+		"02Jan06 15:04",
+		"02Jan2006 15:04",
+		"_2Jan06 150405",
+		"_2Jan2006 150405",
+		"02Jan06 150405",
+		"02Jan2006 150405",
+		"_2Jan06 1504",
+		"_2Jan2006 1504",
+		"02Jan06 1504",
+		"02Jan2006 1504",
 		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
 		"2006/01/02 15:04:05",
+		"2006/01/02 15:04",
+		"20060102 150405",
+		"20060102 1504",
 	}
 	for _, layout := range layouts {
 		if parsed, err := time.ParseInLocation(layout, dateTime, time.Local); err == nil {
 			return parsed, true
 		}
 	}
+	return time.Time{}, false
+}
+
+func parseListDateTimeWithMeridiem(dateField, meridiemField, timeField string) (time.Time, bool) {
+	dateText := strings.Trim(dateField, ",;")
+	meridiem := strings.TrimSpace(strings.Trim(meridiemField, ",;"))
+	timeText := strings.Trim(timeField, ",;")
+
+	layouts := []string{"2006/1/2 15:04:05", "2006/1/2 15:04", "2006/01/02 15:04:05", "2006/01/02 15:04"}
+	for _, layout := range layouts {
+		parsed, err := time.ParseInLocation(layout, dateText+" "+timeText, time.Local)
+		if err != nil {
+			continue
+		}
+
+		hour := parsed.Hour()
+		switch meridiem {
+		case "上午":
+			if hour == 12 {
+				parsed = parsed.Add(-12 * time.Hour)
+			}
+			return parsed, true
+		case "下午":
+			if hour < 12 {
+				parsed = parsed.Add(12 * time.Hour)
+			}
+			return parsed, true
+		}
+	}
+
 	return time.Time{}, false
 }
 
@@ -1306,14 +1773,16 @@ func downloadFile(client *ftp.ServerConn, cfg *Config, remotePath, localName str
 		log.Printf("  📊 遠端檔案大小: %d bytes", remoteSize)
 	} else {
 		logInfo["remote_size"] = "無法取得"
-		log.Printf("WARNING: 無法取得遠端檔案大小: %s", remotePath)
 	}
 	if timeOK {
 		logInfo["remote_time"] = remoteTime.Local().Format("2006-01-02 15:04:05")
 		log.Printf("  🕒 遠端檔案時間: %s", remoteTime.Local().Format("2006-01-02 15:04:05"))
 	} else {
 		logInfo["remote_time"] = "無法取得"
-		log.Printf("WARNING: 無法取得遠端檔案時間: %s", remotePath)
+	}
+
+	if cfg.RequireRemoteMeta && (!sizeOK || !timeOK) {
+		return false, fmt.Errorf("嚴格模式啟用：無法取得遠端完整資訊 (size=%v, time=%v): %s", sizeOK, timeOK, remotePath)
 	}
 	if remoteFileIsKnownEmpty(remoteSize, sizeOK) {
 		log.Printf("  ⊘ 跳過下載 %s：遠端檔案大小為 0 bytes，不進行下載", localName)

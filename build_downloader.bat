@@ -42,7 +42,7 @@ if not exist %LINUX_DIR% mkdir %LINUX_DIR%
 
 set GOOS=linux
 set GOARCH=amd64
-go build -o %LINUX_EXE% ./cmd/downloader
+go build -mod=mod -o %LINUX_EXE% ./cmd/downloader
 set GOOS=
 set GOARCH=
 

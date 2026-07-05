@@ -55,6 +55,20 @@ func TestParseNonStopListLineFullPathName(t *testing.T) {
 	}
 }
 
+func TestParseNonStopListLineWithCommaSize(t *testing.T) {
+	info, ok := parseNonStopListLine("RYM03 101 9,102 25-Jun-2026 21:47:34", "RYM03")
+	if !ok {
+		t.Fatal("expected comma size LIST line to parse")
+	}
+	if !info.sizeAvailable || info.size != 9102 {
+		t.Fatalf("size = %d, available = %v", info.size, info.sizeAvailable)
+	}
+	wantTime := time.Date(2026, time.June, 25, 21, 47, 34, 0, time.Local)
+	if !info.timeAvailable || !info.modTime.Equal(wantTime) {
+		t.Fatalf("time = %v, available = %v", info.modTime, info.timeAvailable)
+	}
+}
+
 func TestFormatLogSize(t *testing.T) {
 	if got := formatLogSize("166440"); got != "166440 bytes" {
 		t.Fatalf("format numeric size = %q", got)
